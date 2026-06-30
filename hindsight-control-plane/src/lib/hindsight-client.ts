@@ -30,12 +30,14 @@ type InboundRequest = { headers: Headers | { get(name: string): string | null } 
  *
  * When an inbound `request` is supplied, auth is resolved per-request via the
  * cascade in {@link dataplaneHeadersFor} (forwarded user token > static key >
- * none). When omitted, it falls back to the static key only — for server-side
- * contexts with no end user (health checks, background tasks).
+ * none) — this is what route handlers acting on behalf of a user should pass.
+ *
+ * When `request` is omitted (or `null`), it falls back to the static key only —
+ * for server-side contexts with no end user (health checks, background tasks).
  */
 export function getDataplaneHeaders(
-  extra?: Record<string, string>,
-  request?: InboundRequest
+  request?: InboundRequest | null,
+  extra?: Record<string, string>
 ): Record<string, string> {
   if (request) {
     return dataplaneHeadersFor(request, extra);
@@ -63,6 +65,24 @@ export function getDataplaneClient(request: InboundRequest) {
       headers: auth ? { Authorization: auth } : undefined,
     })
   );
+}
+
+/**
+ * Build a request-scoped high-level {@link HindsightClient} whose auth is
+ * resolved from the inbound request (forwarded user token > static key > none).
+ *
+ * Use this instead of the shared {@link hindsightClient} singleton in route
+ * handlers that act on behalf of an end user.
+ */
+export function getDataplaneHindsightClient(request: InboundRequest): HindsightClient {
+  const auth = resolveDataplaneAuthHeader(request);
+  // HindsightClient takes an apiKey and prefixes it with "Bearer ". Strip a
+  // leading "Bearer " from the resolved header so we don't double-prefix.
+  const apiKey = auth?.replace(/^Bearer\s+/i, "") || undefined;
+  return new HindsightClient({
+    baseUrl: DATAPLANE_URL,
+    apiKey,
+  });
 }
 
 /**
