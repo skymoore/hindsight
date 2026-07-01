@@ -42,6 +42,7 @@ import {
   ChevronRight,
   LogOut,
   Copy,
+  User,
 } from "lucide-react";
 import { toast } from "sonner";
 import { useTheme } from "@/lib/theme-context";
@@ -571,6 +572,15 @@ function BankSelectorInner() {
                               {bank.visibility === "private"
                                 ? tNavBank("private")
                                 : tNavBank("shared")}
+                            </span>
+                          )}
+                          {bank.ownerLogin && !bank.isOwner && (
+                            <span
+                              className="inline-flex items-center gap-1 shrink-0 text-[11px] text-muted-foreground/70"
+                              title={tNavBank("ownedBy", { user: bank.ownerLogin })}
+                            >
+                              <User className="h-3 w-3" />
+                              {bank.ownerLogin}
                             </span>
                           )}
                           <button

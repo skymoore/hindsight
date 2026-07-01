@@ -53,7 +53,11 @@ import logging
 
 import httpx
 
-from hindsight_api.extensions.builtin.github_org_shared import validate_authz_profile
+from hindsight_api.extensions.builtin.github_org_shared import (
+    encode_org_tenant_id,
+    parse_role_from_org_tenant_id,
+    validate_authz_profile,
+)
 from hindsight_api.extensions.builtin.github_tenant import GitHubTenantExtension
 from hindsight_api.extensions.builtin.oidc_tenant import Identity
 from hindsight_api.extensions.tenant import AuthenticationError, Tenant
@@ -167,9 +171,22 @@ class GitHubOrgTenantExtension(GitHubTenantExtension):
         ``authenticate`` invokes this *before* :meth:`_schema_for_subject`, so
         resolving the org id here (while the caller's token is available)
         guarantees the shared schema name can be derived without a token.
+
+        The base encodes ``context.tenant_id = gh_<id>:<role>``. We re-encode it
+        to the login-aware form ``gh_<id>:<role>:<login>`` so the companion
+        validator and HTTP extension can attribute + display bank ownership by
+        username without another GitHub call. ``login`` comes from the identity
+        claims captured during ``GET /user`` (see
+        :meth:`GitHubTenantExtension._resolve_identity`). Ownership remains keyed
+        on the immutable numeric id; the login is a display-only snapshot.
         """
         await super()._load_roles(token, identity, context)
         await self._ensure_org_id(token)
+
+        role = parse_role_from_org_tenant_id(context.tenant_id)
+        login = (identity.claims or {}).get("login")
+        if role and login:
+            context.tenant_id = encode_org_tenant_id(identity.subject, role, str(login))
 
     def _schema_for_subject(self, subject: str) -> str:
         """Return the single shared org schema, ignoring the per-user subject.

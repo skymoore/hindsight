@@ -56,7 +56,8 @@
       "copyName": "复制名称",
       "copied": "已复制到剪贴板",
       "private": "私有",
-      "shared": "共享"
+      "shared": "共享",
+      "ownedBy": "所有者：{user}"
     },
     "viewOnGitHub": "在 GitHub 查看"
   },
@@ -172,7 +173,8 @@
     "makePrivate": "设为私有",
     "shareSuccess": "记忆库已与团队共享",
     "makePrivateSuccess": "记忆库已设为私有",
-    "visibilityError": "更新可见性失败"
+    "visibilityError": "更新可见性失败",
+    "ownedBy": "所有者：{user}"
   },
   "bankProfile": {
     "noBankSelected": "未选择记忆库",

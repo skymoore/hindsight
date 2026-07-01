@@ -51,6 +51,8 @@ from hindsight_api.extensions.builtin.github_org_shared import (
     VISIBILITY_SHARED,
     OrgSnapshot,
     caller_view_from_snapshot,
+    parse_login_from_tenant_id,
+    parse_role_from_org_tenant_id,
     parse_user_id_from_tenant_id,
     set_pool,
     set_snapshot,
@@ -58,7 +60,6 @@ from hindsight_api.extensions.builtin.github_org_shared import (
 )
 from hindsight_api.extensions.builtin.github_tenant import (
     ROLE_ADMIN,
-    parse_role_from_tenant_id,
 )
 from hindsight_api.extensions.http import HttpExtension
 from hindsight_api.models import RequestContext
@@ -161,11 +162,16 @@ class GitHubOrgBanksHttpExtension(HttpExtension):
             CREATE TABLE IF NOT EXISTS {fq_table(BANK_OWNERSHIP_TABLE)} (
               bank_id text PRIMARY KEY,
               owner_user_id text NOT NULL,
+              owner_login text,
               visibility text NOT NULL DEFAULT '{VISIBILITY_PRIVATE}',
               created_at timestamptz NOT NULL DEFAULT now(),
               updated_at timestamptz NOT NULL DEFAULT now()
             )
             """
+        )
+        # Additive migration for tables created before owner_login existed.
+        await conn.execute(
+            f"ALTER TABLE {fq_table(BANK_OWNERSHIP_TABLE)} ADD COLUMN IF NOT EXISTS owner_login text"
         )
         self._ensured_schemas.add(schema)
 
@@ -186,10 +192,12 @@ class GitHubOrgBanksHttpExtension(HttpExtension):
 
         async with pool.acquire() as conn:
             await self._ensure_table(conn)
-            rows = await conn.fetch(f"SELECT bank_id, owner_user_id, visibility FROM {fq_table(BANK_OWNERSHIP_TABLE)}")
+            rows = await conn.fetch(
+                f"SELECT bank_id, owner_user_id, owner_login, visibility FROM {fq_table(BANK_OWNERSHIP_TABLE)}"
+            )
 
         snapshot = OrgSnapshot(
-            rows={r["bank_id"]: (r["owner_user_id"], r["visibility"]) for r in rows},
+            rows={r["bank_id"]: (r["owner_user_id"], r["visibility"], r["owner_login"]) for r in rows},
             fetched_at=time.monotonic(),
         )
         set_snapshot(snapshot)
@@ -216,7 +224,7 @@ class GitHubOrgBanksHttpExtension(HttpExtension):
             snapshot = await self._refresh_snapshot(memory, request_context)
 
             caller_user_id = parse_user_id_from_tenant_id(request_context.tenant_id)
-            caller_is_admin = parse_role_from_tenant_id(request_context.tenant_id) == ROLE_ADMIN
+            caller_is_admin = parse_role_from_org_tenant_id(request_context.tenant_id) == ROLE_ADMIN
 
             row = snapshot.rows.get(bank_id)
             if row is None:
@@ -226,19 +234,25 @@ class GitHubOrgBanksHttpExtension(HttpExtension):
                 return {
                     "bank_id": bank_id,
                     "owner_user_id": "",
+                    "owner_login": None,
                     "is_owner": False,
                     "visibility": VISIBILITY_SHARED,
                     "can_share": caller_is_admin,
                 }
 
-            owner_user_id, visibility = row
+            owner_user_id, visibility, owner_login = row
             is_owner = caller_user_id is not None and owner_user_id == caller_user_id
             # Hide the existence of private banks the caller can neither own nor admin.
             if visibility == VISIBILITY_PRIVATE and not is_owner and not caller_is_admin:
                 raise HTTPException(status_code=404, detail="Bank not found")
+            # Owner is revealed to admins (any bank) and to everyone for shared
+            # banks; otherwise (caller viewing their own private bank) it is the
+            # caller themselves, which is always fine to return.
+            expose_owner = caller_is_admin or visibility == VISIBILITY_SHARED or is_owner
             return {
                 "bank_id": bank_id,
-                "owner_user_id": owner_user_id,
+                "owner_user_id": owner_user_id if expose_owner else "",
+                "owner_login": owner_login if expose_owner else None,
                 "is_owner": is_owner,
                 "visibility": visibility,
                 "can_share": is_owner or caller_is_admin,
@@ -254,7 +268,8 @@ class GitHubOrgBanksHttpExtension(HttpExtension):
             await self._refresh_snapshot(memory, request_context)
 
             caller_user_id = parse_user_id_from_tenant_id(request_context.tenant_id)
-            caller_is_admin = parse_role_from_tenant_id(request_context.tenant_id) == ROLE_ADMIN
+            caller_is_admin = parse_role_from_org_tenant_id(request_context.tenant_id) == ROLE_ADMIN
+            caller_login = parse_login_from_tenant_id(request_context.tenant_id)
 
             # Changing (or claiming) ownership requires a known caller identity;
             # never write a bank owned by the empty string.
@@ -268,7 +283,7 @@ class GitHubOrgBanksHttpExtension(HttpExtension):
             async with pool.acquire() as conn:
                 await self._ensure_table(conn)
                 existing = await conn.fetchrow(
-                    f"SELECT owner_user_id, visibility FROM {table} WHERE bank_id = $1",
+                    f"SELECT owner_user_id, owner_login, visibility FROM {table} WHERE bank_id = $1",
                     bank_id,
                 )
 
@@ -276,25 +291,40 @@ class GitHubOrgBanksHttpExtension(HttpExtension):
                     # First writer claims ownership and creates the row. The
                     # caller identity is guaranteed non-empty (checked above).
                     owner_user_id = caller_user_id
+                    owner_login = caller_login
                     await conn.execute(
-                        f"INSERT INTO {table} (bank_id, owner_user_id, visibility) VALUES ($1, $2, $3)",
+                        f"INSERT INTO {table} (bank_id, owner_user_id, owner_login, visibility) VALUES ($1, $2, $3, $4)",
                         bank_id,
                         owner_user_id,
+                        owner_login,
                         body.visibility,
                     )
                 else:
                     owner_user_id = existing["owner_user_id"]
+                    owner_login = existing["owner_login"]
                     is_owner = caller_user_id is not None and owner_user_id == caller_user_id
                     if not is_owner and not caller_is_admin:
                         raise HTTPException(
                             status_code=403,
                             detail="Only the bank owner or an org admin may change visibility.",
                         )
-                    await conn.execute(
-                        f"UPDATE {table} SET visibility = $1, updated_at = now() WHERE bank_id = $2",
-                        body.visibility,
-                        bank_id,
-                    )
+                    # Refresh the owner's login snapshot when the owner themselves
+                    # acts (their username may have changed since the claim);
+                    # never overwrite it when an admin edits someone else's bank.
+                    if is_owner and caller_login and caller_login != owner_login:
+                        owner_login = caller_login
+                        await conn.execute(
+                            f"UPDATE {table} SET visibility = $1, owner_login = $2, updated_at = now() WHERE bank_id = $3",
+                            body.visibility,
+                            owner_login,
+                            bank_id,
+                        )
+                    else:
+                        await conn.execute(
+                            f"UPDATE {table} SET visibility = $1, updated_at = now() WHERE bank_id = $2",
+                            body.visibility,
+                            bank_id,
+                        )
 
             # Re-prime the snapshot so the validator observes the write immediately.
             await self._refresh_snapshot(memory, request_context)
@@ -306,6 +336,7 @@ class GitHubOrgBanksHttpExtension(HttpExtension):
             return {
                 "bank_id": bank_id,
                 "owner_user_id": owner_user_id,
+                "owner_login": owner_login,
                 "is_owner": is_owner,
                 "visibility": body.visibility,
                 "can_share": is_owner or caller_is_admin,
@@ -326,18 +357,23 @@ class GitHubOrgBanksHttpExtension(HttpExtension):
             view = caller_view_from_snapshot(snapshot, request_context.tenant_id)
 
             banks: list[dict[str, object]] = []
-            for bank_id, (_owner_user_id, visibility) in snapshot.rows.items():
+            for bank_id, (owner_user_id, visibility, owner_login) in snapshot.rows.items():
                 is_owner = bank_id in view.owned
                 visible = view.is_admin or is_owner or visibility == VISIBILITY_SHARED
                 if not visible:
                     # Private bank owned by someone else: omit unless admin.
                     continue
+                # Owner is revealed to admins (any visible bank) and to everyone
+                # for shared banks. For a caller's own bank it is themselves.
+                expose_owner = view.is_admin or visibility == VISIBILITY_SHARED or is_owner
                 banks.append(
                     {
                         "bank_id": bank_id,
                         "visibility": visibility,
                         "is_owner": is_owner,
                         "can_share": is_owner or view.is_admin,
+                        "owner_user_id": owner_user_id if expose_owner else "",
+                        "owner_login": owner_login if expose_owner else None,
                     }
                 )
 

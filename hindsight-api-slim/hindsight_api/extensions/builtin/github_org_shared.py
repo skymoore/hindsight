@@ -34,7 +34,6 @@ from typing import TYPE_CHECKING
 
 from hindsight_api.extensions.builtin.github_tenant import (
     ROLE_ADMIN,
-    parse_role_from_tenant_id,
 )
 
 if TYPE_CHECKING:
@@ -54,9 +53,12 @@ __all__ = [
     "CallerView",
     "OrgSnapshot",
     "caller_view_from_snapshot",
+    "encode_org_tenant_id",
     "ensure_pool_via_context",
     "get_pool",
     "get_snapshot",
+    "parse_login_from_tenant_id",
+    "parse_role_from_org_tenant_id",
     "parse_user_id_from_tenant_id",
     "set_pool",
     "set_snapshot",
@@ -104,10 +106,12 @@ class CallerPolicy:
 class OrgSnapshot:
     """Whole-org snapshot of the ``bank_ownership`` table.
 
-    ``rows`` maps ``bank_id`` -> ``(owner_user_id, visibility)``.
+    ``rows`` maps ``bank_id`` -> ``(owner_user_id, visibility, owner_login)``.
+    ``owner_login`` is the GitHub username captured at claim time (may be
+    ``None`` for rows written before the column existed, or if it was unknown).
     """
 
-    rows: dict[str, tuple[str, str]] = field(default_factory=dict)
+    rows: dict[str, tuple[str, str, str | None]] = field(default_factory=dict)
     fetched_at: float = 0.0
 
 
@@ -259,17 +263,67 @@ async def _ensure_own_pool() -> "asyncpg.Pool | None":
             return None
 
 
-def parse_user_id_from_tenant_id(tenant_id: str | None) -> str | None:
-    """Extract the GitHub numeric user id from a ``gh_<user_id>:<role>`` tenant_id.
+# ---------------------------------------------------------------------------
+# tenant_id codec (github_org, login-aware)
+# ---------------------------------------------------------------------------
+#
+# The base github_tenant model encodes ``gh_<id>:<role>``. The github_org model
+# extends this to an optional third segment carrying the GitHub login (username),
+# so downstream extensions can attribute + display ownership without an extra
+# GitHub call:
+#
+#     gh_<id>:<role>          (legacy / login unknown)
+#     gh_<id>:<role>:<login>  (login-aware)
+#
+# We provide github_org-local parsers here rather than reusing
+# ``github_tenant.parse_role_from_tenant_id`` (whose ``split(":", 1)[1]`` would
+# fold the login into the role). The base parser is left untouched for the
+# per-user model. A login may itself contain no ``:`` (GitHub usernames are
+# ``[A-Za-z0-9-]``), so a plain ``split(":", 2)`` is unambiguous.
 
-    Mirrors :func:`github_tenant.parse_role_from_tenant_id` for the id half.
-    Returns ``None`` when the tenant_id is missing or not in the expected form.
-    """
+
+def encode_org_tenant_id(github_id: str, role: str, login: str | None) -> str:
+    """Encode ``gh_<id>:<role>[:<login>]`` for the github_org model."""
+    base = f"gh_{github_id}:{role}"
+    if login:
+        return f"{base}:{login}"
+    return base
+
+
+def _split_tenant_body(tenant_id: str | None) -> list[str] | None:
+    """Return ``[id, role, login?]`` from a ``gh_``-prefixed tenant_id, or None."""
     if not tenant_id or not tenant_id.startswith("gh_"):
         return None
     body = tenant_id[len("gh_") :]
-    user_id = body.split(":", 1)[0]
-    return user_id or None
+    return body.split(":", 2)
+
+
+def parse_user_id_from_tenant_id(tenant_id: str | None) -> str | None:
+    """Extract the GitHub numeric user id from a github_org tenant_id."""
+    parts = _split_tenant_body(tenant_id)
+    if not parts:
+        return None
+    return parts[0] or None
+
+
+def parse_role_from_org_tenant_id(tenant_id: str | None) -> str | None:
+    """Extract the role from a github_org tenant_id (``gh_<id>:<role>[:<login>]``).
+
+    Unlike :func:`github_tenant.parse_role_from_tenant_id`, this stops at the
+    second segment so an optional ``:<login>`` suffix is not folded into the role.
+    """
+    parts = _split_tenant_body(tenant_id)
+    if not parts or len(parts) < 2:
+        return None
+    return parts[1] or None
+
+
+def parse_login_from_tenant_id(tenant_id: str | None) -> str | None:
+    """Extract the GitHub login (username) from a github_org tenant_id, or None."""
+    parts = _split_tenant_body(tenant_id)
+    if not parts or len(parts) < 3:
+        return None
+    return parts[2] or None
 
 
 def caller_view_from_snapshot(
@@ -278,10 +332,10 @@ def caller_view_from_snapshot(
 ) -> CallerView:
     """Derive a caller's owned/shared/admin view from the whole-org snapshot."""
     user_id = parse_user_id_from_tenant_id(tenant_id)
-    role = parse_role_from_tenant_id(tenant_id)
+    role = parse_role_from_org_tenant_id(tenant_id)
     owned: set[str] = set()
     shared: set[str] = set()
-    for bank_id, (owner_user_id, visibility) in snapshot.rows.items():
+    for bank_id, (owner_user_id, visibility, _owner_login) in snapshot.rows.items():
         if visibility == VISIBILITY_SHARED:
             shared.add(bank_id)
         if user_id is not None and owner_user_id == user_id:

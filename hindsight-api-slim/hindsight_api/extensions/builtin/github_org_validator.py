@@ -52,6 +52,8 @@ from hindsight_api.extensions.builtin.github_org_shared import (
     caller_view_from_snapshot,
     ensure_pool_via_context,
     get_snapshot,
+    parse_login_from_tenant_id,
+    parse_role_from_org_tenant_id,
     parse_user_id_from_tenant_id,
     set_snapshot,
     snapshot_is_fresh,
@@ -60,7 +62,6 @@ from hindsight_api.extensions.builtin.github_org_shared import (
 from hindsight_api.extensions.builtin.github_tenant import (
     ROLE_ADMIN,
     ROLE_MEMBER,
-    parse_role_from_tenant_id,
 )
 from hindsight_api.extensions.operation_validator import (
     BankListContext,
@@ -121,7 +122,7 @@ class GitHubOrgAuthorizationExtension(OperationValidatorExtension):
 
     def _can_write(self, tenant_id: str | None) -> bool:
         """Return True when the caller's role permits write/compute operations."""
-        return parse_role_from_tenant_id(tenant_id) in _WRITE_ROLES
+        return parse_role_from_org_tenant_id(tenant_id) in _WRITE_ROLES
 
     # ------------------------------------------------------------------
     # Snapshot access
@@ -232,15 +233,22 @@ class GitHubOrgAuthorizationExtension(OperationValidatorExtension):
             CREATE TABLE IF NOT EXISTS {fq_table(BANK_OWNERSHIP_TABLE)} (
               bank_id text PRIMARY KEY,
               owner_user_id text NOT NULL,
+              owner_login text,
               visibility text NOT NULL DEFAULT '{VISIBILITY_PRIVATE}',
               created_at timestamptz NOT NULL DEFAULT now(),
               updated_at timestamptz NOT NULL DEFAULT now()
             )
             """
         )
+        # Additive migration for tables created before owner_login existed.
+        await conn.execute(
+            f"ALTER TABLE {fq_table(BANK_OWNERSHIP_TABLE)} ADD COLUMN IF NOT EXISTS owner_login text"
+        )
         self._ensured_schemas.add(schema)
 
-    async def _claim_bank_if_unowned(self, bank_id: str, caller_user_id: str) -> bool:
+    async def _claim_bank_if_unowned(
+        self, bank_id: str, caller_user_id: str, caller_login: str | None = None
+    ) -> bool:
         """Atomically claim ``bank_id`` as private, owned by ``caller_user_id``.
 
         This is the first-writer-wins ownership rule: the first write-capable
@@ -269,12 +277,13 @@ class GitHubOrgAuthorizationExtension(OperationValidatorExtension):
                 await self._ensure_table(conn)
                 await conn.execute(
                     f"""
-                    INSERT INTO {table} (bank_id, owner_user_id, visibility)
-                    VALUES ($1, $2, $3)
+                    INSERT INTO {table} (bank_id, owner_user_id, owner_login, visibility)
+                    VALUES ($1, $2, $3, $4)
                     ON CONFLICT (bank_id) DO NOTHING
                     """,
                     bank_id,
                     caller_user_id,
+                    caller_login,
                     VISIBILITY_PRIVATE,
                 )
                 # Read back the authoritative owner (handles the race: the row
@@ -349,7 +358,8 @@ class GitHubOrgAuthorizationExtension(OperationValidatorExtension):
         if bank_id not in known:
             caller_user_id = parse_user_id_from_tenant_id(request_context.tenant_id)
             if caller_user_id:
-                return await self._claim_bank_if_unowned(bank_id, caller_user_id)
+                caller_login = parse_login_from_tenant_id(request_context.tenant_id)
+                return await self._claim_bank_if_unowned(bank_id, caller_user_id, caller_login)
             # No parseable identity: an admin may still write (e.g. maintenance),
             # but a non-admin without identity is denied.
             return view.is_admin

@@ -13,6 +13,9 @@ export interface BankInfo {
   fact_count: number;
   last_document_at: string | null;
   visibility?: "private" | "shared";
+  isOwner?: boolean;
+  /** GitHub username of the owner, when the caller is allowed to see it. */
+  ownerLogin?: string | null;
 }
 
 interface BankContextType {
@@ -52,11 +55,17 @@ export function BankProvider({ children }: { children: React.ReactNode }) {
       try {
         const visibilityResponse = await client.listBankVisibility();
         const visibilityById = new Map(
-          (visibilityResponse.banks ?? []).map((b) => [b.bank_id, b.visibility])
+          (visibilityResponse.banks ?? []).map((b) => [b.bank_id, b])
         );
         for (const info of infos) {
-          const visibility = visibilityById.get(info.bank_id);
-          if (visibility) info.visibility = visibility;
+          const v = visibilityById.get(info.bank_id);
+          if (v) {
+            info.visibility = v.visibility;
+            info.isOwner = v.is_owner;
+            // owner_login is only present when the caller may see it (admins for
+            // any bank; everyone for shared banks). Undefined/null otherwise.
+            info.ownerLogin = v.owner_login ?? null;
+          }
         }
       } catch {
         // Visibility feature unavailable — leave visibility undefined.

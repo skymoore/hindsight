@@ -201,7 +201,8 @@ extension (created lazily with `CREATE TABLE IF NOT EXISTS` on first use, via
 ```sql
 CREATE TABLE IF NOT EXISTS bank_ownership (
     bank_id       text PRIMARY KEY,           -- matches banks.bank_id in this schema
-    owner_user_id text NOT NULL,              -- GitHub numeric user id of the creator
+    owner_user_id text NOT NULL,              -- GitHub numeric user id of the creator (immutable key)
+    owner_login   text,                       -- GitHub username at claim time (display only; may go stale)
     visibility    text NOT NULL DEFAULT 'private',  -- 'private' | 'shared'
     created_at    timestamptz NOT NULL DEFAULT now(),
     updated_at    timestamptz NOT NULL DEFAULT now()
@@ -209,6 +210,24 @@ CREATE TABLE IF NOT EXISTS bank_ownership (
 ```
 
 The core `banks` table is **not** modified.
+
+Ownership is keyed on the **immutable** GitHub numeric id, never the username
+(GitHub logins can be renamed and reused, which would otherwise silently
+transfer or break ownership). `owner_login` is a display-only snapshot captured
+when the bank is claimed. The login reaches the write paths by being encoded
+into `RequestContext.tenant_id` as an optional third segment —
+`gh_<id>:<role>:<login>` — by `GitHubOrgTenantExtension` (from the `login`
+claim of `GET /user`), so no extra GitHub call is needed and it survives onto
+async worker tasks. When the owner themselves next changes visibility, their
+`owner_login` snapshot is refreshed; an admin editing another user's bank never
+overwrites it.
+
+**Who may see the owner:** the owner is returned to **admins for any bank they
+can see** (including others' private banks) and to **everyone for shared banks**
+(so the org knows who shared a bank). A non-admin never sees the owner of a
+private bank that isn't theirs — those banks are hidden from them entirely. The
+CP shows the owner's username next to the visibility badge in the bank list and
+on the bank page.
 
 ### How a bank is "created" and how ownership is recorded
 
@@ -268,7 +287,7 @@ per-caller `owned` set (derived from the shared snapshot):
 # (same-process cooperation pattern as github_tenant → github_role_validator)
 
 _ORG_OWNERSHIP: OrgSnapshot | None      # whole-org bank_ownership, TTL ~30s
-# OrgSnapshot = {rows: dict[bank_id -> (owner_user_id, visibility)], fetched_at: float}
+# OrgSnapshot = {rows: dict[bank_id -> (owner_user_id, visibility, owner_login)], fetched_at: float}
 ```
 
 The validator computes, for the current caller (`user_id`, `role` parsed from
@@ -363,13 +382,17 @@ Returns the ownership record for one bank (or the caller's view of it).
 // 200
 {
   "bank_id": "roadmap",
-  "owner_user_id": "1024",
+  "owner_user_id": "1024",        // "" when the caller may not see the owner
+  "owner_login": "skymoore",      // null when hidden or unknown
   "is_owner": true,
   "visibility": "private",        // "private" | "shared"
   "can_share": true               // caller is owner or admin
 }
 // 404 if the caller may not see the bank
 ```
+
+`owner_user_id`/`owner_login` are populated when the caller is an admin, or the
+bank is shared, or the caller is the owner; otherwise they are `""`/`null`.
 
 ### `PUT /v1/default/banks/{bank_id}/visibility`
 
@@ -380,7 +403,7 @@ Claim/create ownership (first call) or change visibility. Idempotent.
 { "visibility": "shared" }        // "private" | "shared"
 
 // 200
-{ "bank_id": "roadmap", "owner_user_id": "1024", "visibility": "shared", "can_share": true }
+{ "bank_id": "roadmap", "owner_user_id": "1024", "owner_login": "skymoore", "visibility": "shared", "can_share": true }
 
 // 403  { "error": "Only the bank owner or an org admin may change visibility." }
 ```

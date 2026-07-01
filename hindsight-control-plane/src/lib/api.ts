@@ -1603,6 +1603,7 @@ export class ControlPlaneClient {
   async getBankVisibility(bankId: string): Promise<{
     bank_id: string;
     owner_user_id: string;
+    owner_login: string | null;
     is_owner: boolean;
     visibility: "private" | "shared";
     can_share: boolean;
@@ -1610,6 +1611,7 @@ export class ControlPlaneClient {
     return this.fetchApi<{
       bank_id: string;
       owner_user_id: string;
+      owner_login: string | null;
       is_owner: boolean;
       visibility: "private" | "shared";
       can_share: boolean;
@@ -1625,12 +1627,14 @@ export class ControlPlaneClient {
   ): Promise<{
     bank_id: string;
     owner_user_id: string;
+    owner_login: string | null;
     visibility: "private" | "shared";
     can_share: boolean;
   }> {
     return this.fetchApi<{
       bank_id: string;
       owner_user_id: string;
+      owner_login: string | null;
       visibility: "private" | "shared";
       can_share: boolean;
     }>(bankApi(bankId, "/visibility"), {
@@ -1648,6 +1652,8 @@ export class ControlPlaneClient {
       visibility: "private" | "shared";
       is_owner: boolean;
       can_share: boolean;
+      owner_user_id?: string;
+      owner_login?: string | null;
     }>;
   }> {
     return this.fetchApi<{
@@ -1656,6 +1662,8 @@ export class ControlPlaneClient {
         visibility: "private" | "shared";
         is_owner: boolean;
         can_share: boolean;
+        owner_user_id?: string;
+        owner_login?: string | null;
       }>;
     }>("/api/banks/visibility");
   }

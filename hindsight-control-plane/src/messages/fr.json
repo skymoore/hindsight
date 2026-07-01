@@ -56,7 +56,8 @@
       "copyName": "Copier le nom",
       "copied": "Copié dans le presse-papiers",
       "private": "Privé",
-      "shared": "Partagé"
+      "shared": "Partagé",
+      "ownedBy": "Appartient à {user}"
     },
     "viewOnGitHub": "Voir sur GitHub"
   },
@@ -172,7 +173,8 @@
     "makePrivate": "Rendre privé",
     "shareSuccess": "Banque partagée avec l'équipe",
     "makePrivateSuccess": "Banque rendue privée",
-    "visibilityError": "Échec de la mise à jour de la visibilité"
+    "visibilityError": "Échec de la mise à jour de la visibilité",
+    "ownedBy": "Appartient à {user}"
   },
   "bankProfile": {
     "noBankSelected": "Aucune banque sélectionnée",

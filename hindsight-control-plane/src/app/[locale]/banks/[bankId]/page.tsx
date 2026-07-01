@@ -55,6 +55,7 @@ import {
   FlaskConical,
   Share2,
   Lock,
+  User,
 } from "lucide-react";
 import { LlmHealthDialog } from "@/components/llm-health-dialog";
 import { ExtractDialog } from "@/components/extract-dialog";
@@ -102,12 +103,16 @@ export default function BankPage() {
   // Bank visibility (private/shared) state
   const [visibility, setVisibility] = useState<"private" | "shared" | null>(null);
   const [canShare, setCanShare] = useState(false);
+  const [ownerLogin, setOwnerLogin] = useState<string | null>(null);
+  const [isOwner, setIsOwner] = useState(false);
   const [isUpdatingVisibility, setIsUpdatingVisibility] = useState(false);
 
   useEffect(() => {
     if (!bankId) {
       setVisibility(null);
       setCanShare(false);
+      setOwnerLogin(null);
+      setIsOwner(false);
       return;
     }
     let cancelled = false;
@@ -117,12 +122,16 @@ export default function BankPage() {
         if (cancelled) return;
         setVisibility(result.visibility);
         setCanShare(result.can_share);
+        setIsOwner(result.is_owner);
+        setOwnerLogin(result.owner_login ?? null);
       })
       .catch(() => {
         // Visibility feature may be disabled on the dataplane — hide the control.
         if (cancelled) return;
         setVisibility(null);
         setCanShare(false);
+        setOwnerLogin(null);
+        setIsOwner(false);
       });
     return () => {
       cancelled = true;
@@ -284,6 +293,12 @@ export default function BankPage() {
                         <DropdownMenuItem onClick={() => setShowLlmHealthDialog(true)}>
                           <Activity className="w-4 h-4 mr-2" />
                           {t("health")}
+                        </DropdownMenuItem>
+                      )}
+                      {ownerLogin && !isOwner && (
+                        <DropdownMenuItem disabled>
+                          <User className="w-4 h-4 mr-2" />
+                          {t("ownedBy", { user: ownerLogin })}
                         </DropdownMenuItem>
                       )}
                       {canShare && visibility && (

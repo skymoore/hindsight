@@ -56,7 +56,8 @@
       "copyName": "이름 복사",
       "copied": "클립보드에 복사됨",
       "private": "비공개",
-      "shared": "공유됨"
+      "shared": "공유됨",
+      "ownedBy": "소유자: {user}"
     },
     "viewOnGitHub": "GitHub에서 보기"
   },
@@ -172,7 +173,8 @@
     "makePrivate": "비공개로 전환",
     "shareSuccess": "뱅크를 팀과 공유했습니다",
     "makePrivateSuccess": "뱅크를 비공개로 설정했습니다",
-    "visibilityError": "공개 설정을 업데이트하지 못했습니다"
+    "visibilityError": "공개 설정을 업데이트하지 못했습니다",
+    "ownedBy": "소유자: {user}"
   },
   "bankProfile": {
     "noBankSelected": "선택된 뱅크 없음",

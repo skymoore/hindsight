@@ -56,7 +56,8 @@
       "copyName": "Name kopieren",
       "copied": "In Zwischenablage kopiert",
       "private": "Privat",
-      "shared": "Geteilt"
+      "shared": "Geteilt",
+      "ownedBy": "Gehört {user}"
     },
     "viewOnGitHub": "Auf GitHub ansehen"
   },
@@ -172,7 +173,8 @@
     "makePrivate": "Privat machen",
     "shareSuccess": "Bank mit dem Team geteilt",
     "makePrivateSuccess": "Bank auf privat gesetzt",
-    "visibilityError": "Sichtbarkeit konnte nicht aktualisiert werden"
+    "visibilityError": "Sichtbarkeit konnte nicht aktualisiert werden",
+    "ownedBy": "Gehört {user}"
   },
   "bankProfile": {
     "noBankSelected": "Keine Bank ausgewählt",

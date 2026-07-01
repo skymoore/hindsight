@@ -25,8 +25,11 @@ from hindsight_api.extensions.builtin.github_org_shared import (
     VISIBILITY_SHARED,
     OrgSnapshot,
     caller_view_from_snapshot,
+    encode_org_tenant_id,
     ensure_pool_via_context,
     get_pool,
+    parse_login_from_tenant_id,
+    parse_role_from_org_tenant_id,
     parse_user_id_from_tenant_id,
     set_pool,
     set_snapshot,
@@ -66,18 +69,57 @@ def _reset_shared_state():
     shared._OWN_POOL_LOCK = None
 
 
-def _fresh_snapshot(rows: dict[str, tuple[str, str]]) -> OrgSnapshot:
-    """Build a snapshot that reads as fresh under the default TTL."""
-    return OrgSnapshot(rows=dict(rows), fetched_at=time.monotonic())
+def _fresh_snapshot(rows: dict[str, tuple]) -> OrgSnapshot:
+    """Build a snapshot that reads as fresh under the default TTL.
+
+    Accepts 2-tuples ``(owner_user_id, visibility)`` or 3-tuples
+    ``(owner_user_id, visibility, owner_login)`` and normalizes to the 3-tuple
+    shape the OrgSnapshot now stores.
+    """
+    normalized = {
+        bank_id: (row[0], row[1], row[2] if len(row) > 2 else None) for bank_id, row in rows.items()
+    }
+    return OrgSnapshot(rows=normalized, fetched_at=time.monotonic())
 
 
-def _ctx(user_id: str, role: str) -> RequestContext:
-    return RequestContext(api_key="x", tenant_id=encode_tenant_id(user_id, role))
+def _ctx(user_id: str, role: str, login: str | None = None) -> RequestContext:
+    return RequestContext(api_key="x", tenant_id=encode_org_tenant_id(user_id, role, login))
 
 
 # ---------------------------------------------------------------------------
 # 1. Shared helpers
 # ---------------------------------------------------------------------------
+
+
+class TestTenantIdCodec:
+    """The login-aware ``gh_<id>:<role>[:<login>]`` codec."""
+
+    def test_encode_with_login(self):
+        assert encode_org_tenant_id("1024", "admin", "skymoore") == "gh_1024:admin:skymoore"
+
+    def test_encode_without_login(self):
+        assert encode_org_tenant_id("1024", "admin", None) == "gh_1024:admin"
+        assert encode_org_tenant_id("1024", "admin", "") == "gh_1024:admin"
+
+    def test_roundtrip_login_aware(self):
+        tid = encode_org_tenant_id("55", "member", "octocat")
+        assert parse_user_id_from_tenant_id(tid) == "55"
+        assert parse_role_from_org_tenant_id(tid) == "member"
+        assert parse_login_from_tenant_id(tid) == "octocat"
+
+    def test_role_not_polluted_by_login(self):
+        # The 3rd segment must not fold into the role (the base parser bug we avoid).
+        assert parse_role_from_org_tenant_id("gh_55:member:octocat") == "member"
+
+    def test_legacy_two_segment(self):
+        assert parse_user_id_from_tenant_id("gh_55:member") == "55"
+        assert parse_role_from_org_tenant_id("gh_55:member") == "member"
+        assert parse_login_from_tenant_id("gh_55:member") is None
+
+    def test_malformed(self):
+        for bad in (None, "garbage", "gh_:admin", ""):
+            assert parse_login_from_tenant_id(bad) is None
+        assert parse_role_from_org_tenant_id("gh_1024") is None
 
 
 class TestSharedHelpers:
@@ -449,24 +491,25 @@ class TestFirstWriterOwnership:
     @pytest.mark.asyncio
     async def test_member_write_unowned_bank_claims_and_allows(self, validator, monkeypatch):
         set_snapshot(_fresh_snapshot(_ROWS))
-        claimed: list[tuple[str, str]] = []
+        claimed: list[tuple[str, str, str | None]] = []
 
-        async def _fake_claim(bank_id, caller_user_id):
-            claimed.append((bank_id, caller_user_id))
+        async def _fake_claim(bank_id, caller_user_id, caller_login=None):
+            claimed.append((bank_id, caller_user_id, caller_login))
             return True
 
         monkeypatch.setattr(validator, "_claim_bank_if_unowned", _fake_claim)
-        member = _ctx("1024", ROLE_MEMBER)
+        # login-aware tenant_id: the claim must receive the username too.
+        member = _ctx("1024", ROLE_MEMBER, "skymoore")
         # "fresh" is not in the snapshot -> unowned -> claim -> allowed.
         assert (await validator.validate_bank_write(_write_ctx("fresh", member))).allowed
-        assert claimed == [("fresh", "1024")]
+        assert claimed == [("fresh", "1024", "skymoore")]
 
     @pytest.mark.asyncio
     async def test_retain_unowned_bank_claims_private(self, validator, monkeypatch):
         set_snapshot(_fresh_snapshot(_ROWS))
         calls: list[tuple[str, str]] = []
 
-        async def _fake_claim(bank_id, caller_user_id):
+        async def _fake_claim(bank_id, caller_user_id, caller_login=None):
             calls.append((bank_id, caller_user_id))
             return True
 
@@ -480,7 +523,7 @@ class TestFirstWriterOwnership:
         # A concurrent caller won the claim: our claim returns False -> deny.
         set_snapshot(_fresh_snapshot(_ROWS))
 
-        async def _fake_claim(bank_id, caller_user_id):
+        async def _fake_claim(bank_id, caller_user_id, caller_login=None):
             return False
 
         monkeypatch.setattr(validator, "_claim_bank_if_unowned", _fake_claim)
@@ -492,7 +535,7 @@ class TestFirstWriterOwnership:
         set_snapshot(_fresh_snapshot(_ROWS))
         called = False
 
-        async def _fake_claim(bank_id, caller_user_id):
+        async def _fake_claim(bank_id, caller_user_id, caller_login=None):
             nonlocal called
             called = True
             return True
@@ -510,7 +553,7 @@ class TestFirstWriterOwnership:
         set_snapshot(_fresh_snapshot(_ROWS))
         claimed: list[tuple[str, str]] = []
 
-        async def _fake_claim(bank_id, caller_user_id):
+        async def _fake_claim(bank_id, caller_user_id, caller_login=None):
             claimed.append((bank_id, caller_user_id))
             return True
 
@@ -525,7 +568,7 @@ class TestFirstWriterOwnership:
         set_snapshot(_fresh_snapshot(_ROWS))
         called = False
 
-        async def _fake_claim(bank_id, caller_user_id):
+        async def _fake_claim(bank_id, caller_user_id, caller_login=None):
             nonlocal called
             called = True
             return True
@@ -540,7 +583,7 @@ class TestFirstWriterOwnership:
         set_snapshot(_fresh_snapshot(_ROWS))
         called = False
 
-        async def _fake_claim(bank_id, caller_user_id):
+        async def _fake_claim(bank_id, caller_user_id, caller_login=None):
             nonlocal called
             called = True
             return True
