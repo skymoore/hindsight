@@ -1216,6 +1216,22 @@ export type CreateMentalModelResponse = {
 };
 
 /**
+ * CreateSharedSchemaRequest
+ *
+ * Request body for POST /v1/shared/schemas.
+ */
+export type CreateSharedSchemaRequest = {
+  /**
+   * Schema Name
+   */
+  schema_name: string;
+  /**
+   * Display Name
+   */
+  display_name?: string | null;
+};
+
+/**
  * CreateWebhookRequest
  *
  * Request model for registering a webhook.
@@ -3583,6 +3599,50 @@ export type RetryOperationResponse = {
    * Operation Id
    */
   operation_id: string;
+};
+
+/**
+ * SharedSchemaInfo
+ *
+ * A single shared schema entry returned by the list endpoint.
+ */
+export type SharedSchemaInfo = {
+  /**
+   * Schema Name
+   */
+  schema_name: string;
+  /**
+   * Display Name
+   */
+  display_name?: string | null;
+  /**
+   * Created At
+   */
+  created_at?: string | null;
+  /**
+   * Writable
+   */
+  writable: boolean;
+};
+
+/**
+ * SharedSchemasResponse
+ *
+ * Response model for GET /v1/shared/schemas.
+ */
+export type SharedSchemasResponse = {
+  /**
+   * Private Schema
+   */
+  private_schema: string;
+  /**
+   * Shared
+   */
+  shared: Array<SharedSchemaInfo>;
+  /**
+   * Can Create
+   */
+  can_create: boolean;
 };
 
 /**
@@ -7362,3 +7422,132 @@ export type LlmRequestStatsResponses = {
 };
 
 export type LlmRequestStatsResponse2 = LlmRequestStatsResponses[keyof LlmRequestStatsResponses];
+
+export type ListSharedSchemasData = {
+  body?: never;
+  headers?: {
+    /**
+     * Authorization
+     */
+    authorization?: string | null;
+  };
+  path?: never;
+  query?: never;
+  url: "/v1/shared/schemas";
+};
+
+export type ListSharedSchemasErrors = {
+  /**
+   * Validation Error
+   */
+  422: HttpValidationError;
+};
+
+export type ListSharedSchemasError = ListSharedSchemasErrors[keyof ListSharedSchemasErrors];
+
+export type ListSharedSchemasResponses = {
+  /**
+   * Successful Response
+   */
+  200: SharedSchemasResponse;
+};
+
+export type ListSharedSchemasResponse =
+  ListSharedSchemasResponses[keyof ListSharedSchemasResponses];
+
+export type CreateSharedSchemaData = {
+  body: CreateSharedSchemaRequest;
+  headers?: {
+    /**
+     * Authorization
+     */
+    authorization?: string | null;
+  };
+  path?: never;
+  query?: never;
+  url: "/v1/shared/schemas";
+};
+
+export type CreateSharedSchemaErrors = {
+  /**
+   * Validation Error
+   */
+  422: HttpValidationError;
+};
+
+export type CreateSharedSchemaError = CreateSharedSchemaErrors[keyof CreateSharedSchemaErrors];
+
+export type CreateSharedSchemaResponses = {
+  /**
+   * Successful Response
+   */
+  201: unknown;
+};
+
+export type DeleteSharedSchemaData = {
+  body?: never;
+  headers?: {
+    /**
+     * Authorization
+     */
+    authorization?: string | null;
+  };
+  path: {
+    /**
+     * Schema Name
+     */
+    schema_name: string;
+  };
+  query?: never;
+  url: "/v1/shared/schemas/{schema_name}";
+};
+
+export type DeleteSharedSchemaErrors = {
+  /**
+   * Validation Error
+   */
+  422: HttpValidationError;
+};
+
+export type DeleteSharedSchemaError = DeleteSharedSchemaErrors[keyof DeleteSharedSchemaErrors];
+
+export type DeleteSharedSchemaResponses = {
+  /**
+   * Successful Response
+   */
+  200: unknown;
+};
+
+export type DropSharedSchemaData = {
+  body?: never;
+  headers?: {
+    /**
+     * Authorization
+     */
+    authorization?: string | null;
+  };
+  path: {
+    /**
+     * Schema Name
+     */
+    schema_name: string;
+  };
+  query?: never;
+  url: "/v1/shared/schemas/{schema_name}/data";
+};
+
+export type DropSharedSchemaErrors = {
+  /**
+   * Validation Error
+   */
+  422: HttpValidationError;
+};
+
+export type DropSharedSchemaError = DropSharedSchemaErrors[keyof DropSharedSchemaErrors];
+
+export type DropSharedSchemaResponses = {
+  /**
+   * Successful Response
+   */
+  200: unknown;
+};

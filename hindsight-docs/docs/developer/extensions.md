@@ -381,6 +381,207 @@ hindsight-api
 
 ---
 
+## Shared memory banks
+
+Shared memory banks let multiple users read from and write to the same set of banks — for example, a shared codebase bank that every engineer on a team can query and contribute to. This is an opt-in feature layered on top of the existing per-user schema isolation model.
+
+### Concept
+
+Hindsight isolates each tenant into its own PostgreSQL schema. Historically, each user got exactly one private schema (e.g. `user_<subject>`). Shared schemas are **additional** schemas that multiple users access simultaneously (read-many / write-many). A user now sees:
+
+- Their **private banks** — addressed by bare `bank_id` (e.g. `api-v2`)
+- The **banks in any shared schema they're a member of** — addressed by qualified `schema/bank_id` (e.g. `shared_frontend/api-v2`)
+
+Shared schemas are structurally identical to private schemas: same table set, same migrations, same worker processing. The only difference is that membership is shared across users rather than being one-to-one.
+
+### Registry
+
+Shared schemas are tracked in a global `public.shared_schemas` table:
+
+| Column | Type | Description |
+| --- | --- | --- |
+| `schema_name` | TEXT (PK) | PostgreSQL schema name, e.g. `shared_my_codebase` |
+| `display_name` | TEXT | Human-friendly label |
+| `created_by` | TEXT | Opaque identifier of the admin who created it |
+| `created_at` | TIMESTAMPTZ | Creation timestamp |
+
+**Naming rule:** shared schema names must start with `shared_` and contain only lowercase letters, digits, and underscores (e.g. `shared_frontend`, `shared_platform_infra`). This is enforced at creation time and validated at extension startup.
+
+**Membership is not stored here.** The registry only tracks which shared schemas exist. Who may access each schema is resolved at request time by the tenant extension from the identity provider (GitHub team membership / OIDC group claims). This keeps the registry simple and avoids a second source of truth for group membership.
+
+### Qualified bank IDs
+
+| Format | Meaning |
+| --- | --- |
+| `api-v2` | Bank `api-v2` in the caller's own private schema |
+| `shared_frontend/api-v2` | Bank `api-v2` in the `shared_frontend` schema |
+
+When using qualified IDs in REST paths, URL-encode the `/` separator:
+
+```
+GET /v1/default/banks/shared_frontend%2Fapi-v2/memories/recall
+```
+
+`GET /v1/default/banks` returns private banks with bare IDs and shared banks with `schema/`-qualified IDs, so callers can discover all accessible banks from a single call.
+
+### Per-extension configuration
+
+#### OidcTenantExtension
+
+The OIDC extension resolves shared schema membership from a **JWT group claim**. Two new config keys control this:
+
+| Config key | Env var | Default | Description |
+| --- | --- | --- | --- |
+| `shared_group_claim` | `HINDSIGHT_API_TENANT_SHARED_GROUP_CLAIM` | `groups` | JWT claim that carries the user's group memberships |
+| `shared_schema_map` | `HINDSIGHT_API_TENANT_SHARED_SCHEMA_MAP` | _(none)_ | Comma-separated `group:shared_schema` pairs |
+
+```bash
+HINDSIGHT_API_TENANT_EXTENSION=hindsight_api.extensions.builtin.oidc_tenant:OidcTenantExtension
+HINDSIGHT_API_TENANT_OIDC_ISSUER=https://your-tenant.auth0.com/
+
+# Map OIDC groups to shared schemas
+HINDSIGHT_API_TENANT_SHARED_GROUP_CLAIM=groups          # claim name in the JWT (default: groups)
+HINDSIGHT_API_TENANT_SHARED_SCHEMA_MAP=frontend-team:shared_frontend,platform:shared_platform_infra
+```
+
+The `groups` claim may be a JSON array of strings or a space/comma-delimited string. A user whose token contains `"groups": ["frontend-team", "platform"]` would gain access to both `shared_frontend` and `shared_platform_infra` in addition to their private schema.
+
+#### GitHubTenantExtension
+
+The GitHub extension resolves shared schema membership from **GitHub team slugs** (within the configured org). The same `shared_schema_map` env var is used, but the keys are team slugs instead of group names:
+
+| Config key | Env var | Default | Description |
+| --- | --- | --- | --- |
+| `shared_schema_map` | `HINDSIGHT_API_TENANT_SHARED_SCHEMA_MAP` | _(none)_ | Comma-separated `team-slug:shared_schema` pairs |
+
+```bash
+HINDSIGHT_API_TENANT_EXTENSION=hindsight_api.extensions.builtin.github_tenant:GitHubTenantExtension
+HINDSIGHT_API_TENANT_GITHUB_ORG=my-org
+
+# Existing role mapping (unchanged)
+HINDSIGHT_API_TENANT_GITHUB_ADMIN_TEAMS=platform-admins
+HINDSIGHT_API_TENANT_GITHUB_MEMBER_TEAMS=engineering,data
+HINDSIGHT_API_TENANT_GITHUB_VIEWER_TEAMS=analysts
+
+# Map GitHub team slugs to shared schemas
+HINDSIGHT_API_TENANT_SHARED_SCHEMA_MAP=frontend:shared_frontend,platform-infra:shared_platform_infra
+```
+
+Team slugs are matched case-insensitively. A user who is a member of the `frontend` team in `my-org` gains access to `shared_frontend`. Team membership is fetched from the GitHub API alongside role resolution and cached for the same TTL (`HINDSIGHT_API_TENANT_GITHUB_ROLE_CACHE_TTL`).
+
+> **Note:** The `shared_schema_map` config key is the same for both extensions. The env var prefix rule applies: `HINDSIGHT_API_TENANT_SHARED_SCHEMA_MAP` → config key `shared_schema_map` (prefix stripped, lowercased).
+
+### Access model
+
+| Actor | Capability |
+| --- | --- |
+| Any member of a shared schema | Read (recall/reflect) and write (retain) to all banks in that schema |
+| `admin` role (GitHub) | May create, deregister, and destructively drop (delete all data of) shared schemas via the API |
+| Non-admin / `member` / `viewer` | Cannot create, deregister, or drop shared schemas |
+
+Shared schemas follow the same read-many/write-many model: there is no read-only membership tier at the schema level. If you need read-only access to a shared schema, gate it at the `OperationValidatorExtension` layer.
+
+Creating, deregistering, or destructively dropping a shared schema is an admin-only operation. For `GitHubTenantExtension`, "admin" means the user's resolved role is `admin` (i.e. they are in one of the `HINDSIGHT_API_TENANT_GITHUB_ADMIN_TEAMS`). For `OidcTenantExtension`, admin gating is enforced by the API layer based on the caller's resolved role.
+
+### API endpoints
+
+These endpoints manage the shared schema registry. They are available when a tenant extension that supports shared schemas is configured.
+
+#### `GET /v1/shared/schemas`
+
+Returns the shared schemas visible to the caller — their private schema plus any shared schemas they are a member of. Also indicates whether the caller may create new shared schemas.
+
+**Response:**
+```json
+{
+  "schemas": [
+    {
+      "schema_name": "shared_frontend",
+      "display_name": "Frontend Codebase",
+      "created_by": "gh_12345678:admin",
+      "created_at": "2026-07-01T10:00:00Z"
+    }
+  ],
+  "can_create": true
+}
+```
+
+`can_create` is `true` when the caller has the `admin` role (or equivalent). Non-admin callers see `false`.
+
+#### `POST /v1/shared/schemas` _(admin only)_
+
+Registers and provisions a new shared schema. The `schema_name` must start with `shared_`.
+
+**Request:**
+```json
+{
+  "schema_name": "shared_frontend",
+  "display_name": "Frontend Codebase"
+}
+```
+
+**Response:** the created registry record (same shape as a single item in the `GET` response).
+
+Returns `403 Forbidden` for non-admin callers. Returns `400 Bad Request` if the name does not start with `shared_` or is otherwise invalid.
+
+#### `DELETE /v1/shared/schemas/{schema}` _(admin only)_
+
+Deregisters a shared schema — removes the `public.shared_schemas` row. **This does not drop the underlying PostgreSQL schema or its data.** The schema becomes invisible and inaccessible via qualified bank IDs, but its tables and rows are preserved (e.g. so it can be re-registered later). To also erase the data, use the destructive endpoint below.
+
+Returns `404 Not Found` if the schema is not registered. Returns `403 Forbidden` for non-admin callers.
+
+#### `DELETE /v1/shared/schemas/{schema}/data` _(admin only)_
+
+**Destructive and irreversible.** Deregisters the shared schema **and** drops the underlying PostgreSQL schema with `DROP SCHEMA ... CASCADE`, permanently deleting every bank, memory, and document stored in it. Deregistration and the schema drop run in a single transaction.
+
+**Response:**
+```json
+{ "schema_name": "shared_frontend", "dropped": true }
+```
+
+Guardrails: the target name is re-validated against the `shared_` prefix + identifier rules before any drop, so this can never affect `public` or a private `user_*` schema. Returns `404 Not Found` if the schema is not registered, `403 Forbidden` for non-admin callers, and `400 Bad Request` if the name is not a valid shared schema.
+
+In the Control Plane UI this is the second step of a deliberate two-step flow: operators first **Deregister**, and the destructive **Delete data** action requires typing the exact schema name to confirm.
+
+### Worker behavior
+
+No configuration is needed. The worker discovers schemas with pending work by scanning `pg_namespace` for schemas that have pending tasks, so shared schemas are serviced automatically alongside private schemas. There is no distinction in worker processing between a private schema and a shared schema.
+
+### Backward compatibility
+
+Shared schemas are entirely opt-in:
+
+- Extensions that only set `TenantContext.schema_name` (e.g. `ApiKeyTenantExtension`, `SupabaseTenantExtension`, single-tenant custom extensions) are **unaffected**. `readable_schemas` and `writable_schemas` default to empty sets, so no shared-schema logic is triggered.
+- For `OidcTenantExtension` and `GitHubTenantExtension`, if `HINDSIGHT_API_TENANT_SHARED_SCHEMA_MAP` is not set, no shared schemas are resolved and behavior is identical to before.
+- Existing bank IDs (bare, unqualified) continue to refer to the caller's private schema with no change.
+
+### How it fits together
+
+```
+User authenticates
+  └─ TenantExtension.authenticate()
+       ├─ Resolves private schema (e.g. user_12345)
+       ├─ Resolves shared schemas from identity provider
+       │    OIDC: reads JWT groups claim → maps via shared_schema_map
+       │    GitHub: fetches team slugs → maps via shared_schema_map
+       └─ Returns TenantContext(
+              schema_name="user_12345",
+              readable_schemas={"shared_frontend"},
+              writable_schemas={"shared_frontend"},
+          )
+
+Caller requests bank "shared_frontend/api-v2"
+  └─ API layer parses schema/bank_id → schema="shared_frontend", bank_id="api-v2"
+  └─ Checks schema is in TenantContext.readable_schemas (or writable_schemas for writes)
+  └─ Executes query against shared_frontend schema
+
+Worker polls for work
+  └─ Scans pg_namespace for schemas with pending tasks
+  └─ Processes shared_frontend tasks alongside user_* tasks — no special config needed
+```
+
+---
+
 ## Contributing Extensions
 
 Custom extensions that solve common use cases are welcome contributions to the Hindsight project. If you've built an extension for:

@@ -70,6 +70,17 @@ from .sql import SQLDialect, create_sql_dialect
 # Note: default is None, actual default comes from config via get_current_schema()
 _current_schema: contextvars.ContextVar[str | None] = contextvars.ContextVar("current_schema", default=None)
 
+# Context variables for shared-schema membership (async-safe, per-task isolation).
+# Set by _authenticate_tenant from TenantContext.readable_schemas / writable_schemas.
+# The primary schema (_current_schema) is always implicitly readable+writable regardless
+# of these sets — see get_readable_schemas() / get_writable_schemas().
+_readable_schemas: contextvars.ContextVar[frozenset[str]] = contextvars.ContextVar(
+    "readable_schemas", default=frozenset()
+)
+_writable_schemas: contextvars.ContextVar[frozenset[str]] = contextvars.ContextVar(
+    "writable_schemas", default=frozenset()
+)
+
 # Context variable for the bank an operation runs for (async-safe, per-task isolation).
 # Set by the engine wherever it learns the bank (recall/retain/batch/task execution) so
 # downstream provider calls can attribute spend per bank — e.g. tagging the OpenAI `user`
@@ -85,6 +96,24 @@ def get_current_schema() -> str:
         # Fall back to configured default schema
         return get_config().database_schema
     return schema
+
+
+def get_readable_schemas() -> frozenset[str]:
+    """Return the set of schemas the current caller may read from.
+
+    Always includes the primary schema (``get_current_schema()``) so callers
+    never need to union it in manually.
+    """
+    return _readable_schemas.get() | frozenset([get_current_schema()])
+
+
+def get_writable_schemas() -> frozenset[str]:
+    """Return the set of schemas the current caller may write to.
+
+    Always includes the primary schema (``get_current_schema()``) so callers
+    never need to union it in manually.
+    """
+    return _writable_schemas.get() | frozenset([get_current_schema()])
 
 
 def get_current_bank_id() -> str | None:
@@ -252,6 +281,28 @@ class _LlmProbeOutcome:
     ok: bool
     status: str
     latency_ms: float | None
+
+
+@dataclass
+class BankTarget:
+    """Result of :meth:`MemoryEngine.resolve_bank_target`.
+
+    Carries the routing decision for a (possibly qualified) bank id:
+
+    * ``schema`` — the shared schema to target, or ``None`` for the caller's
+      primary schema.  When ``None``, no schema override is needed.
+    * ``bank_id`` — the bare (unqualified) bank id to use in DB queries.
+
+    Typical usage::
+
+        target = await self.resolve_bank_target(raw_bank_id, write=True)
+        async with self._schema_override(target.schema):
+            bank_id = target.bank_id
+            # ... existing body using fq_table() ...
+    """
+
+    schema: str | None
+    bank_id: str
 
 
 def _consolidation_retry_backoff_seconds(retry_count: int) -> int:
@@ -1267,6 +1318,12 @@ class MemoryEngine(MemoryEngineInterface):
             max_entries=config.bank_stats_cache_max_entries,
         )
 
+        # In-memory guard: tracks shared schemas that have already been migrated
+        # on this worker/process so we skip redundant run_migration() calls.
+        # run_migration() is idempotent, but it acquires advisory locks and runs
+        # Alembic — skipping it after the first call is a meaningful perf win.
+        self._bootstrapped_shared_schemas: set[str] = set()
+
     @property
     def audit_logger(self) -> AuditLogger:
         """The audit logger for feature usage tracking."""
@@ -1338,7 +1395,162 @@ class MemoryEngine(MemoryEngineInterface):
 
         _current_schema.set(tenant_context.schema_name)
         self._ext_ctx.current_schema = tenant_context.schema_name
+        # Propagate shared-schema membership so resolve_bank_target / list_banks can
+        # enforce read/write access without re-calling the extension.
+        _readable_schemas.set(frozenset(tenant_context.readable_schemas))
+        _writable_schemas.set(frozenset(tenant_context.writable_schemas))
         return tenant_context.schema_name
+
+    # ------------------------------------------------------------------
+    # Shared-schema routing helpers
+    # ------------------------------------------------------------------
+
+    async def resolve_bank_target(self, bank_id: str, *, write: bool) -> BankTarget:
+        """Parse a possibly-qualified bank id and enforce shared-schema membership.
+
+        Bank ids arrive in two forms:
+
+        * ``"bank"`` — bare id, targets the caller's primary (private) schema.
+          Returns ``BankTarget(schema=None, bank_id="bank")``.
+        * ``"schema/bank"`` — qualified id, targets a shared schema.
+          Returns ``BankTarget(schema="schema", bank_id="bank")`` after:
+
+          a. Validating ``schema`` starts with ``shared_`` (SHARED_SCHEMA_PREFIX).
+          b. Checking the caller's membership: ``schema`` must be in the readable
+             set (for reads) or writable set (for writes). The primary schema is
+             always allowed. Violation → ``OperationValidationError(status_code=403)``.
+          c. Verifying the shared schema is registered in ``public.shared_schemas``.
+             Not registered → ``OperationValidationError(status_code=404)``.
+          d. First-write bootstrap: when ``write=True`` and the schema has not yet
+             been migrated on this worker, calls ``self._ext_ctx.run_migration(schema)``
+             (idempotent). Subsequent calls are skipped via
+             ``self._bootstrapped_shared_schemas``.
+
+        Error signalling:
+          * 403 Forbidden  → ``OperationValidationError(reason, status_code=403)``
+            (same class used by OperationValidator rejections — maps to HTTP 403).
+          * 404 Not Found  → ``OperationValidationError(reason, status_code=404)``
+            (consistent with how the engine signals a missing bank to HTTP callers).
+
+        Config keying for shared banks:
+          The ``_schema_override`` context manager sets ``_current_schema`` to the
+          shared schema for the duration of the operation. ``fq_table()`` and
+          ``ConfigResolver._load_bank_config()`` both read ``_current_schema`` via
+          ``get_current_schema()``, so bank-level config is automatically resolved
+          against the shared schema's ``banks`` table — no extra adjustment needed.
+          Tenant-level config is keyed by ``request_context`` (passed through to
+          ``get_tenant_config``); for shared-bank ops the caller's ``request_context``
+          is used, which is correct (the caller's tenant policy applies).
+        """
+        from hindsight_api.extensions import OperationValidationError
+
+        from . import shared_schemas
+
+        if "/" not in bank_id:
+            # Bare id — primary schema, no access check needed.
+            return BankTarget(schema=None, bank_id=bank_id)
+
+        schema, bare_bank_id = bank_id.split("/", 1)
+
+        # (a) Validate prefix.
+        if not schema.startswith(shared_schemas.SHARED_SCHEMA_PREFIX):
+            raise OperationValidationError(
+                f"Qualified bank id '{bank_id}': schema part must start with "
+                f"'{shared_schemas.SHARED_SCHEMA_PREFIX}' (got '{schema}')",
+                status_code=403,
+            )
+
+        # (b) Membership check.
+        primary = get_current_schema()
+        if schema == primary:
+            # Primary schema addressed via qualified form — always allowed.
+            pass
+        elif write:
+            allowed = _writable_schemas.get() | frozenset([primary])
+            if schema not in allowed:
+                raise OperationValidationError(
+                    f"Write access to shared schema '{schema}' is not permitted for this caller.",
+                    status_code=403,
+                )
+        else:
+            allowed = _readable_schemas.get() | frozenset([primary])
+            if schema not in allowed:
+                raise OperationValidationError(
+                    f"Read access to shared schema '{schema}' is not permitted for this caller.",
+                    status_code=403,
+                )
+
+        # (c) Registry check — shared schema must be registered.
+        backend = await self._get_backend()
+        exists = await shared_schemas.shared_schema_exists(backend, schema)
+        if not exists:
+            raise OperationValidationError(
+                f"Shared schema '{schema}' is not registered.",
+                status_code=404,
+            )
+
+        # (d) First-write bootstrap: ensure the physical schema is migrated.
+        if write and schema not in self._bootstrapped_shared_schemas:
+            await self._ext_ctx.run_migration(schema)
+            self._bootstrapped_shared_schemas.add(schema)
+
+        return BankTarget(schema=schema, bank_id=bare_bank_id)
+
+    def _schema_override(self, schema: str | None):
+        """Async context manager that temporarily overrides ``_current_schema``.
+
+        When ``schema`` is ``None`` (bare bank id → primary schema), this is a
+        no-op and the existing ``_current_schema`` value is left unchanged.
+
+        Usage::
+
+            target = await self.resolve_bank_target(bank_id, write=True)
+            async with self._schema_override(target.schema):
+                bank_id = target.bank_id
+                # All fq_table() calls inside here target `target.schema`
+                ...
+
+        The contextvar token is reset on exit (including on exception), so the
+        override is strictly scoped to the ``async with`` block.
+        """
+        import contextlib
+
+        @contextlib.asynccontextmanager
+        async def _ctx():
+            if schema is None:
+                yield
+                return
+            token = _current_schema.set(schema)
+            old_ext_schema = self._ext_ctx.current_schema
+            self._ext_ctx.current_schema = schema
+            try:
+                yield
+            finally:
+                _current_schema.reset(token)
+                self._ext_ctx.current_schema = old_ext_schema
+
+        return _ctx()
+
+    # TODO: The following bank_id-taking methods should be updated to call
+    # ``resolve_bank_target`` + ``_schema_override`` (same pattern as
+    # retain_batch_async, recall_async, reflect_async, get_bank_profile, list_banks):
+    #
+    #   retain_async (delegates to retain_batch_async — already covered)
+    #   import_bank_async, import_documents_async
+    #   get_document, delete_document, update_document
+    #   delete_bank, clear_observations, list_observation_scopes
+    #   retry_failed_consolidation, clear_observations_for_memory
+    #   update_memory_unit, run_consolidation, get_graph_data
+    #   extract_dry_run, list_memory_units, get_memory_unit
+    #   get_observation_history, list_documents, get_chunk, list_document_chunks
+    #   reprocess_document, list_llm_requests, llm_request_stats
+    #   list_audit_logs, audit_log_stats
+    #   set_bank_mission, merge_bank_mission
+    #   submit_async_consolidation, get_bank_stats, get_bank_freshness
+    #   check_bank_llm, get_mental_model, refresh_mental_model, list_mental_models
+    #
+    # Until then, these methods only operate on the caller's primary schema and
+    # will return a 404/error if a qualified bank_id ("schema/bank") is passed.
 
     async def _handle_import_documents(self, task_dict: dict[str, Any]):
         """Handler for async document-import tasks.
@@ -3255,310 +3467,316 @@ class MemoryEngine(MemoryEngineInterface):
         # Authenticate tenant and set schema in context (for fq_table())
         await self._authenticate_tenant(request_context)
 
-        # Validate operation if validator is configured
-        contents_copy = [dict(c) for c in contents]  # Convert TypedDict to regular dict for extension
-        if self._operation_validator:
-            from hindsight_api.extensions import RetainContext
+        # Route to the correct schema (primary or shared) and enforce write membership.
+        # TODO: all other bank_id-taking methods should adopt resolve_bank_target too.
+        _retain_target = await self.resolve_bank_target(bank_id, write=True)
+        bank_id = _retain_target.bank_id
+        async with self._schema_override(_retain_target.schema):
 
-            ctx = RetainContext(
-                bank_id=bank_id,
-                contents=contents_copy,
-                request_context=request_context,
-                document_id=document_id,
-                fact_type_override=fact_type_override,
-            )
-            result = await self._validate_operation(self._operation_validator.validate_retain(ctx))
-            if result and result.contents is not None:
-                contents = cast(list[RetainContentDict], result.contents)
+            # Validate operation if validator is configured
+            contents_copy = [dict(c) for c in contents]  # Convert TypedDict to regular dict for extension
+            if self._operation_validator:
+                from hindsight_api.extensions import RetainContext
 
-        # Engine-owned copy: the orchestrator clears per-item "content" strings
-        # after building the document's combined text (memory pressure
-        # optimization, see retain/orchestrator.py). Without an internal copy
-        # those mutations leak back to the caller's dicts.
-        contents = cast(list[RetainContentDict], [dict(c) for c in contents])
+                ctx = RetainContext(
+                    bank_id=bank_id,
+                    contents=contents_copy,
+                    request_context=request_context,
+                    document_id=document_id,
+                    fact_type_override=fact_type_override,
+                )
+                result = await self._validate_operation(self._operation_validator.validate_retain(ctx))
+                if result and result.contents is not None:
+                    contents = cast(list[RetainContentDict], result.contents)
 
-        # Sanitize content/context at ingress so lone UTF-16 surrogates (e.g. a
-        # half-emoji a client serialized as a `\udXXX` escape) cannot crash the
-        # embedder, cross-encoder, or logging with an HTTP 500 (see issue #1875).
-        for item in contents:
-            if "content" in item:
-                item["content"] = sanitize_text(item["content"]) or ""
-            if item.get("context"):
-                item["context"] = sanitize_text(item["context"]) or ""
+            # Engine-owned copy: the orchestrator clears per-item "content" strings
+            # after building the document's combined text (memory pressure
+            # optimization, see retain/orchestrator.py). Without an internal copy
+            # those mutations leak back to the caller's dicts.
+            contents = cast(list[RetainContentDict], [dict(c) for c in contents])
 
-        # Apply batch-level document_id to contents that don't have their own (backwards compatibility)
-        if document_id:
+            # Sanitize content/context at ingress so lone UTF-16 surrogates (e.g. a
+            # half-emoji a client serialized as a `\udXXX` escape) cannot crash the
+            # embedder, cross-encoder, or logging with an HTTP 500 (see issue #1875).
             for item in contents:
-                if "document_id" not in item:
-                    item["document_id"] = document_id
+                if "content" in item:
+                    item["content"] = sanitize_text(item["content"]) or ""
+                if item.get("context"):
+                    item["context"] = sanitize_text(item["context"]) or ""
 
-        if outbox_callback is None and outbox_callback_factory is not None:
-            outbox_callback = outbox_callback_factory(contents)
+            # Apply batch-level document_id to contents that don't have their own (backwards compatibility)
+            if document_id:
+                for item in contents:
+                    if "document_id" not in item:
+                        item["document_id"] = document_id
 
-        # Validate no duplicate document_ids in the batch
-        # Having duplicate document_ids causes race conditions in document upserts during parallel processing
-        doc_ids = [item.get("document_id") for item in contents if item.get("document_id")]
-        if len(doc_ids) != len(set(doc_ids)):
-            from collections import Counter
+            if outbox_callback is None and outbox_callback_factory is not None:
+                outbox_callback = outbox_callback_factory(contents)
 
-            duplicates = [doc_id for doc_id, count in Counter(doc_ids).items() if count > 1]
-            raise ValueError(
-                f"Batch contains duplicate document_ids: {duplicates}. "
-                f"Each content item in a batch must have a unique document_id to avoid race conditions."
-            )
+            # Validate no duplicate document_ids in the batch
+            # Having duplicate document_ids causes race conditions in document upserts during parallel processing
+            doc_ids = [item.get("document_id") for item in contents if item.get("document_id")]
+            if len(doc_ids) != len(set(doc_ids)):
+                from collections import Counter
 
-        # Validate update_mode=append requires document_id
-        for item in contents:
-            if item.get("update_mode") == "append" and not item.get("document_id"):
-                raise ValueError("update_mode='append' requires a document_id")
-
-        # Append mode rebuilds the full document by reading back the previously
-        # stored original_text and prepending it. With store_document_text
-        # disabled there is no stored text to read, so the append would silently
-        # drop all prior content — reject it explicitly instead.
-        if not get_config().store_document_text:
-            for item in contents:
-                if item.get("update_mode") == "append":
-                    raise ValueError(
-                        "update_mode='append' is not supported when HINDSIGHT_API_STORE_DOCUMENT_TEXT "
-                        "is disabled: the prior document text is not stored and cannot be appended to. "
-                        "Use update_mode='replace' instead."
-                    )
-
-        # Auto-chunk large batches by token count to avoid timeouts and memory issues
-        # Calculate total token count
-        total_tokens = sum(count_tokens(item.get("content", "")) for item in contents)
-        total_usage = TokenUsage()
-        # Aggregate "content tokens that actually went through extraction after
-        # chunk-level dedup" across sub-batches. ``None`` in any sub-batch
-        # means that sub-batch bypassed dedup, so the aggregate is None
-        # (see RetainResult.processed_content_tokens).
-        total_processed_content_tokens: int | None = 0
-
-        # Get batch size threshold from config
-        config = get_config()
-        tokens_per_batch = config.retain_batch_tokens
-
-        if total_tokens > tokens_per_batch:
-            # Split into smaller batches based on token count
-            logger.info(
-                f"Large batch detected ({total_tokens:,} tokens from {len(contents)} items). Splitting into sub-batches of ~{tokens_per_batch:,} tokens each..."
-            )
-
-            split = _split_contents_into_sub_batches(contents, tokens_per_batch)
-            sub_batches = split.sub_batches
-            origin_indices = split.origin_indices
-            document_body_overrides = split.document_body_overrides
-
-            sub_batch_sizes = [len(b) for b in sub_batches]
-            # Keep the per-sub-batch sizes log compact when an oversize
-            # single item gets chunked into many [1]-sized sub-batches.
-            if len(sub_batches) <= 20:
-                logger.info(f"Split into {len(sub_batches)} sub-batches: {sub_batch_sizes} items each")
-            else:
-                logger.info(
-                    f"Split into {len(sub_batches)} sub-batches "
-                    f"(items per sub-batch: min={min(sub_batch_sizes)}, "
-                    f"max={max(sub_batch_sizes)}, total={sum(sub_batch_sizes)})"
+                duplicates = [doc_id for doc_id, count in Counter(doc_ids).items() if count > 1]
+                raise ValueError(
+                    f"Batch contains duplicate document_ids: {duplicates}. "
+                    f"Each content item in a batch must have a unique document_id to avoid race conditions."
                 )
 
-            # Preserve the public contract: one result list per input
-            # content. When an oversize single item is chunked across
-            # multiple sub-batches, unit_ids from every chunk get
-            # appended back into that input's result slot.
-            per_input_results: list[list[str]] = [[] for _ in contents]
-
-            # Per-document chunk_index offsets. When an oversized single item is
-            # sliced into several sub-batches that all share one document_id and
-            # run sequentially, each sub-batch must continue the document's
-            # chunk_index sequence rather than restart at 0 — otherwise the
-            # derived chunk_id ({bank}_{doc}_{index}) collides and later
-            # sub-batches overwrite earlier chunks, leaving only one sub-batch's
-            # worth of chunks/memories (issue #1888). Counting uses the same
-            # bank-resolved, strategy-applied chunk size the orchestrator chunks
-            # with, so the offsets match the chunk_index values it assigns.
-            from .retain import fact_extraction, fact_storage
-
-            chunking_config = await self._resolve_retain_chunking_config(bank_id, request_context, strategy)
-            chunk_offsets: dict[str, int] = {}
-
-            # In update_mode="append", retain_batch prepends the existing document
-            # body to the FIRST sub-batch as an extra content item before chunking
-            # (see orchestrator.retain_batch), consuming chunks(existing_body)
-            # additional chunk_index slots ahead of that sub-batch's own content.
-            # Capture that chunk count per document up front — the first sub-batch
-            # overwrites documents.original_text when it commits, so it can't be
-            # read back afterwards — and fold it into the offset so later
-            # sub-batches continue past the prepended chunks instead of colliding.
-            append_prepend_chunks: dict[str, int] = {}
-            backend = await self._get_backend()
-            append_doc_ids: set[str] = set()
+            # Validate update_mode=append requires document_id
             for item in contents:
-                item_doc_id = item.get("document_id")
-                if item.get("update_mode") == "append" and item_doc_id:
-                    append_doc_ids.add(item_doc_id)
-            for append_doc_id in append_doc_ids:
-                async with acquire_with_retry(backend) as conn:
-                    existing_text = await fact_storage.get_document_content(conn, bank_id, append_doc_id)
-                if existing_text:
-                    append_prepend_chunks[append_doc_id] = len(
-                        fact_extraction.chunk_text(
-                            existing_text,
-                            chunking_config.chunk_size,
-                            structured_chunk_size=chunking_config.structured_chunk_size,
+                if item.get("update_mode") == "append" and not item.get("document_id"):
+                    raise ValueError("update_mode='append' requires a document_id")
+
+            # Append mode rebuilds the full document by reading back the previously
+            # stored original_text and prepending it. With store_document_text
+            # disabled there is no stored text to read, so the append would silently
+            # drop all prior content — reject it explicitly instead.
+            if not get_config().store_document_text:
+                for item in contents:
+                    if item.get("update_mode") == "append":
+                        raise ValueError(
+                            "update_mode='append' is not supported when HINDSIGHT_API_STORE_DOCUMENT_TEXT "
+                            "is disabled: the prior document text is not stored and cannot be appended to. "
+                            "Use update_mode='replace' instead."
                         )
-                    )
 
-            for i, (sub_batch, sub_origins) in enumerate(zip(sub_batches, origin_indices), 1):
-                # Checkpoint: abort if the operation was deleted (bank was deleted) between sub-batches.
-                if operation_id and not await self._check_op_alive(operation_id):
-                    logger.info(
-                        f"[BATCH_RETAIN] bank={bank_id} operation {operation_id} cancelled (bank deleted), stopping after {i - 1}/{len(sub_batches)} sub-batches"
-                    )
-                    if return_usage:
-                        return per_input_results, total_usage
-                    return per_input_results
+            # Auto-chunk large batches by token count to avoid timeouts and memory issues
+            # Calculate total token count
+            total_tokens = sum(count_tokens(item.get("content", "")) for item in contents)
+            total_usage = TokenUsage()
+            # Aggregate "content tokens that actually went through extraction after
+            # chunk-level dedup" across sub-batches. ``None`` in any sub-batch
+            # means that sub-batch bypassed dedup, so the aggregate is None
+            # (see RetainResult.processed_content_tokens).
+            total_processed_content_tokens: int | None = 0
 
-                sub_batch_tokens = sum(count_tokens(item.get("content", "")) for item in sub_batch)
+            # Get batch size threshold from config
+            config = get_config()
+            tokens_per_batch = config.retain_batch_tokens
+
+            if total_tokens > tokens_per_batch:
+                # Split into smaller batches based on token count
                 logger.info(
-                    f"Processing sub-batch {i}/{len(sub_batches)}: {len(sub_batch)} items, {sub_batch_tokens:,} tokens"
+                    f"Large batch detected ({total_tokens:,} tokens from {len(contents)} items). Splitting into sub-batches of ~{tokens_per_batch:,} tokens each..."
                 )
-                # Live worker stage for the in-flight sub-batch; the durable progress
-                # snapshot is written *after* the sub-batch commits (below) so processed
-                # reflects work actually done and reaches total on completion.
-                set_stage(f"batch_retain.sub_batch.{i}")
 
-                # Resolve the document this sub-batch writes to so we can offset
-                # its chunk_index past chunks already stored by earlier
-                # sub-batches of the same document. Only the oversized-single-item
-                # split shares a document_id across sub-batches; packed multi-item
-                # sub-batches carry distinct document_ids (offset stays 0).
-                sub_doc_id = document_id or (sub_batch[0].get("document_id") if len(sub_batch) == 1 else None)
-                sub_offset = chunk_offsets.get(sub_doc_id, 0) if sub_doc_id else 0
+                split = _split_contents_into_sub_batches(contents, tokens_per_batch)
+                sub_batches = split.sub_batches
+                origin_indices = split.origin_indices
+                document_body_overrides = split.document_body_overrides
 
-                # Count the chunks this sub-batch will produce BEFORE handing it
-                # to the orchestrator. retain_batch consumes (pops) each item's
-                # "content" while streaming, so reading it back after the call
-                # yields "" — and chunk_text("") returns [""] (count 1),
-                # advancing the per-document cursor by 1 regardless of the real
-                # chunk count. For slices that each span several chunks the next
-                # sub-batch then restarts ~1 slot in, colliding chunk_ids and
-                # overwriting earlier chunks (only ~1 new chunk survives per
-                # sub-batch). Capture it here while content is still present.
-                sub_chunk_count = 0
-                if sub_doc_id:
-                    sub_chunk_count = sum(
-                        len(
+                sub_batch_sizes = [len(b) for b in sub_batches]
+                # Keep the per-sub-batch sizes log compact when an oversize
+                # single item gets chunked into many [1]-sized sub-batches.
+                if len(sub_batches) <= 20:
+                    logger.info(f"Split into {len(sub_batches)} sub-batches: {sub_batch_sizes} items each")
+                else:
+                    logger.info(
+                        f"Split into {len(sub_batches)} sub-batches "
+                        f"(items per sub-batch: min={min(sub_batch_sizes)}, "
+                        f"max={max(sub_batch_sizes)}, total={sum(sub_batch_sizes)})"
+                    )
+
+                # Preserve the public contract: one result list per input
+                # content. When an oversize single item is chunked across
+                # multiple sub-batches, unit_ids from every chunk get
+                # appended back into that input's result slot.
+                per_input_results: list[list[str]] = [[] for _ in contents]
+
+                # Per-document chunk_index offsets. When an oversized single item is
+                # sliced into several sub-batches that all share one document_id and
+                # run sequentially, each sub-batch must continue the document's
+                # chunk_index sequence rather than restart at 0 — otherwise the
+                # derived chunk_id ({bank}_{doc}_{index}) collides and later
+                # sub-batches overwrite earlier chunks, leaving only one sub-batch's
+                # worth of chunks/memories (issue #1888). Counting uses the same
+                # bank-resolved, strategy-applied chunk size the orchestrator chunks
+                # with, so the offsets match the chunk_index values it assigns.
+                from .retain import fact_extraction, fact_storage
+
+                chunking_config = await self._resolve_retain_chunking_config(bank_id, request_context, strategy)
+                chunk_offsets: dict[str, int] = {}
+
+                # In update_mode="append", retain_batch prepends the existing document
+                # body to the FIRST sub-batch as an extra content item before chunking
+                # (see orchestrator.retain_batch), consuming chunks(existing_body)
+                # additional chunk_index slots ahead of that sub-batch's own content.
+                # Capture that chunk count per document up front — the first sub-batch
+                # overwrites documents.original_text when it commits, so it can't be
+                # read back afterwards — and fold it into the offset so later
+                # sub-batches continue past the prepended chunks instead of colliding.
+                append_prepend_chunks: dict[str, int] = {}
+                backend = await self._get_backend()
+                append_doc_ids: set[str] = set()
+                for item in contents:
+                    item_doc_id = item.get("document_id")
+                    if item.get("update_mode") == "append" and item_doc_id:
+                        append_doc_ids.add(item_doc_id)
+                for append_doc_id in append_doc_ids:
+                    async with acquire_with_retry(backend) as conn:
+                        existing_text = await fact_storage.get_document_content(conn, bank_id, append_doc_id)
+                    if existing_text:
+                        append_prepend_chunks[append_doc_id] = len(
                             fact_extraction.chunk_text(
-                                item.get("content", "") or "",
+                                existing_text,
                                 chunking_config.chunk_size,
                                 structured_chunk_size=chunking_config.structured_chunk_size,
                             )
                         )
-                        for item in sub_batch
+
+                for i, (sub_batch, sub_origins) in enumerate(zip(sub_batches, origin_indices), 1):
+                    # Checkpoint: abort if the operation was deleted (bank was deleted) between sub-batches.
+                    if operation_id and not await self._check_op_alive(operation_id):
+                        logger.info(
+                            f"[BATCH_RETAIN] bank={bank_id} operation {operation_id} cancelled (bank deleted), stopping after {i - 1}/{len(sub_batches)} sub-batches"
+                        )
+                        if return_usage:
+                            return per_input_results, total_usage
+                        return per_input_results
+
+                    sub_batch_tokens = sum(count_tokens(item.get("content", "")) for item in sub_batch)
+                    logger.info(
+                        f"Processing sub-batch {i}/{len(sub_batches)}: {len(sub_batch)} items, {sub_batch_tokens:,} tokens"
+                    )
+                    # Live worker stage for the in-flight sub-batch; the durable progress
+                    # snapshot is written *after* the sub-batch commits (below) so processed
+                    # reflects work actually done and reaches total on completion.
+                    set_stage(f"batch_retain.sub_batch.{i}")
+
+                    # Resolve the document this sub-batch writes to so we can offset
+                    # its chunk_index past chunks already stored by earlier
+                    # sub-batches of the same document. Only the oversized-single-item
+                    # split shares a document_id across sub-batches; packed multi-item
+                    # sub-batches carry distinct document_ids (offset stays 0).
+                    sub_doc_id = document_id or (sub_batch[0].get("document_id") if len(sub_batch) == 1 else None)
+                    sub_offset = chunk_offsets.get(sub_doc_id, 0) if sub_doc_id else 0
+
+                    # Count the chunks this sub-batch will produce BEFORE handing it
+                    # to the orchestrator. retain_batch consumes (pops) each item's
+                    # "content" while streaming, so reading it back after the call
+                    # yields "" — and chunk_text("") returns [""] (count 1),
+                    # advancing the per-document cursor by 1 regardless of the real
+                    # chunk count. For slices that each span several chunks the next
+                    # sub-batch then restarts ~1 slot in, colliding chunk_ids and
+                    # overwriting earlier chunks (only ~1 new chunk survives per
+                    # sub-batch). Capture it here while content is still present.
+                    sub_chunk_count = 0
+                    if sub_doc_id:
+                        sub_chunk_count = sum(
+                            len(
+                                fact_extraction.chunk_text(
+                                    item.get("content", "") or "",
+                                    chunking_config.chunk_size,
+                                    structured_chunk_size=chunking_config.structured_chunk_size,
+                                )
+                            )
+                            for item in sub_batch
+                        )
+
+                    sub_results, sub_usage, sub_processed = await self._retain_batch_async_internal(
+                        bank_id=bank_id,
+                        contents=sub_batch,
+                        request_context=request_context,
+                        document_id=document_id,
+                        is_first_batch=i == 1,  # Only upsert on first batch
+                        fact_type_override=fact_type_override,
+                        document_tags=document_tags,
+                        operation_id=operation_id,
+                        strategy=strategy,
+                        # Outbox callback runs inside the last sub-batch's transaction so the
+                        # webhook delivery row is committed atomically with the final retain data.
+                        outbox_callback=outbox_callback if i == len(sub_batches) else None,
+                        outbox_callback_factory=outbox_callback_factory if i == len(sub_batches) else None,
+                        document_body_override=document_body_overrides[i - 1],
+                        chunk_index_offset=sub_offset,
                     )
 
-                sub_results, sub_usage, sub_processed = await self._retain_batch_async_internal(
+                    # Advance the document's chunk_index cursor by the number of
+                    # chunks this sub-batch produced (counted above, before the
+                    # orchestrator consumed the content), so the next sub-batch
+                    # sharing the document continues the sequence.
+                    if sub_doc_id:
+                        # retain_batch only prepends the existing body on the global
+                        # first sub-batch (is_first_batch == i == 1), so fold its chunk
+                        # count in only there.
+                        if i == 1:
+                            sub_chunk_count += append_prepend_chunks.get(sub_doc_id, 0)
+                        chunk_offsets[sub_doc_id] = sub_offset + sub_chunk_count
+                    # sub_results aligns 1:1 with sub_batch items; map each
+                    # back to its source input via origin_indices so callers
+                    # iterating with ``zip(contents, results)`` still align.
+                    for sub_idx, origin_idx in enumerate(sub_origins):
+                        if sub_idx < len(sub_results):
+                            per_input_results[origin_idx].extend(sub_results[sub_idx])
+                    total_usage = total_usage + sub_usage
+                    if total_processed_content_tokens is None or sub_processed is None:
+                        total_processed_content_tokens = None
+                    else:
+                        total_processed_content_tokens = total_processed_content_tokens + sub_processed
+                    # Per-sub-batch progress is intentionally not written here: the streaming
+                    # retain pipeline emits finer-grained "storing N/total chunks" snapshots
+                    # via progress_callback as each sub-batch's chunks commit.
+
+                total_time = time.time() - start_time
+                logger.info(
+                    f"RETAIN_BATCH_ASYNC (chunked) COMPLETE: {len(per_input_results)} results from {len(contents)} contents in {total_time:.3f}s"
+                )
+                result = per_input_results
+            else:
+                # Small batch - use internal method directly (single sub-batch).
+                set_stage("batch_retain.sub_batch.1")
+                result, total_usage, total_processed_content_tokens = await self._retain_batch_async_internal(
                     bank_id=bank_id,
-                    contents=sub_batch,
+                    contents=contents,
                     request_context=request_context,
                     document_id=document_id,
-                    is_first_batch=i == 1,  # Only upsert on first batch
+                    is_first_batch=True,
                     fact_type_override=fact_type_override,
                     document_tags=document_tags,
                     operation_id=operation_id,
                     strategy=strategy,
-                    # Outbox callback runs inside the last sub-batch's transaction so the
-                    # webhook delivery row is committed atomically with the final retain data.
-                    outbox_callback=outbox_callback if i == len(sub_batches) else None,
-                    outbox_callback_factory=outbox_callback_factory if i == len(sub_batches) else None,
-                    document_body_override=document_body_overrides[i - 1],
-                    chunk_index_offset=sub_offset,
+                    outbox_callback=outbox_callback,
+                    outbox_callback_factory=outbox_callback_factory,
                 )
+                # Progress for this path is emitted by the streaming pipeline as
+                # "storing N/total chunks" via progress_callback (see _retain_batch_async_internal).
 
-                # Advance the document's chunk_index cursor by the number of
-                # chunks this sub-batch produced (counted above, before the
-                # orchestrator consumed the content), so the next sub-batch
-                # sharing the document continues the sequence.
-                if sub_doc_id:
-                    # retain_batch only prepends the existing body on the global
-                    # first sub-batch (is_first_batch == i == 1), so fold its chunk
-                    # count in only there.
-                    if i == 1:
-                        sub_chunk_count += append_prepend_chunks.get(sub_doc_id, 0)
-                    chunk_offsets[sub_doc_id] = sub_offset + sub_chunk_count
-                # sub_results aligns 1:1 with sub_batch items; map each
-                # back to its source input via origin_indices so callers
-                # iterating with ``zip(contents, results)`` still align.
-                for sub_idx, origin_idx in enumerate(sub_origins):
-                    if sub_idx < len(sub_results):
-                        per_input_results[origin_idx].extend(sub_results[sub_idx])
-                total_usage = total_usage + sub_usage
-                if total_processed_content_tokens is None or sub_processed is None:
-                    total_processed_content_tokens = None
-                else:
-                    total_processed_content_tokens = total_processed_content_tokens + sub_processed
-                # Per-sub-batch progress is intentionally not written here: the streaming
-                # retain pipeline emits finer-grained "storing N/total chunks" snapshots
-                # via progress_callback as each sub-batch's chunks commit.
+            await self._write_retain_outcome_metadata(operation_id, result)
 
-            total_time = time.time() - start_time
-            logger.info(
-                f"RETAIN_BATCH_ASYNC (chunked) COMPLETE: {len(per_input_results)} results from {len(contents)} contents in {total_time:.3f}s"
-            )
-            result = per_input_results
-        else:
-            # Small batch - use internal method directly (single sub-batch).
-            set_stage("batch_retain.sub_batch.1")
-            result, total_usage, total_processed_content_tokens = await self._retain_batch_async_internal(
-                bank_id=bank_id,
-                contents=contents,
-                request_context=request_context,
-                document_id=document_id,
-                is_first_batch=True,
-                fact_type_override=fact_type_override,
-                document_tags=document_tags,
-                operation_id=operation_id,
-                strategy=strategy,
-                outbox_callback=outbox_callback,
-                outbox_callback_factory=outbox_callback_factory,
-            )
-            # Progress for this path is emitted by the streaming pipeline as
-            # "storing N/total chunks" via progress_callback (see _retain_batch_async_internal).
+            # Call post-operation hook if validator is configured
+            if self._operation_validator:
+                from hindsight_api.extensions import RetainResult
 
-        await self._write_retain_outcome_metadata(operation_id, result)
+                result_ctx = RetainResult(
+                    bank_id=bank_id,
+                    contents=contents_copy,
+                    request_context=request_context,
+                    document_id=document_id,
+                    fact_type_override=fact_type_override,
+                    unit_ids=result,
+                    success=True,
+                    error=None,
+                    llm_input_tokens=total_usage.input_tokens,
+                    llm_output_tokens=total_usage.output_tokens,
+                    llm_total_tokens=total_usage.total_tokens,
+                    llm_cached_input_tokens=getattr(total_usage, "cached_tokens", 0) or 0,
+                    llm_thoughts_tokens=getattr(total_usage, "thoughts_tokens", 0) or 0,
+                    processed_content_tokens=total_processed_content_tokens,
+                )
+                try:
+                    await self._operation_validator.on_retain_complete(result_ctx)
+                except Exception as e:
+                    logger.warning(f"Post-retain hook error (non-fatal): {e}")
 
-        # Call post-operation hook if validator is configured
-        if self._operation_validator:
-            from hindsight_api.extensions import RetainResult
+            # Same async side effects every fact insert triggers (retain or import).
+            await self._submit_post_insert_maintenance(bank_id, request_context)
 
-            result_ctx = RetainResult(
-                bank_id=bank_id,
-                contents=contents_copy,
-                request_context=request_context,
-                document_id=document_id,
-                fact_type_override=fact_type_override,
-                unit_ids=result,
-                success=True,
-                error=None,
-                llm_input_tokens=total_usage.input_tokens,
-                llm_output_tokens=total_usage.output_tokens,
-                llm_total_tokens=total_usage.total_tokens,
-                llm_cached_input_tokens=getattr(total_usage, "cached_tokens", 0) or 0,
-                llm_thoughts_tokens=getattr(total_usage, "thoughts_tokens", 0) or 0,
-                processed_content_tokens=total_processed_content_tokens,
-            )
-            try:
-                await self._operation_validator.on_retain_complete(result_ctx)
-            except Exception as e:
-                logger.warning(f"Post-retain hook error (non-fatal): {e}")
-
-        # Same async side effects every fact insert triggers (retain or import).
-        await self._submit_post_insert_maintenance(bank_id, request_context)
-
-        if return_usage:
-            return result, total_usage
-        return result
+            if return_usage:
+                return result, total_usage
+            return result
 
     async def _submit_post_insert_maintenance(
         self,
@@ -4017,212 +4235,46 @@ class MemoryEngine(MemoryEngineInterface):
         # Authenticate tenant and set schema in context (for fq_table())
         await self._authenticate_tenant(request_context)
 
-        # Cooperative cancellation checkpoint: if the client already disconnected
-        # while this request waited to be scheduled, abort before doing any work
-        # (issue #2122). Further checkpoints sit at each pipeline stage boundary
-        # inside _search_with_retries.
-        request_context.raise_if_cancelled()
+        # Route to the correct schema (primary or shared) and enforce read membership.
+        # TODO: all other bank_id-taking methods should adopt resolve_bank_target too.
+        _recall_target = await self.resolve_bank_target(bank_id, write=False)
+        bank_id = _recall_target.bank_id
+        async with self._schema_override(_recall_target.schema):
 
-        # Sanitize the query at ingress: a client may serialize a half-emoji as a
-        # lone UTF-16 surrogate, which crashes downstream logging, the embedder, and
-        # the cross-encoder tokenizer with an HTTP 500 (see issue #1875). Cleaning it
-        # here protects every sink that the query flows into.
-        query = sanitize_text(query) or ""
+            # Cooperative cancellation checkpoint: if the client already disconnected
+            # while this request waited to be scheduled, abort before doing any work
+            # (issue #2122). Further checkpoints sit at each pipeline stage boundary
+            # inside _search_with_retries.
+            request_context.raise_if_cancelled()
 
-        # Default to all fact types if not specified
-        if fact_type is None:
-            fact_type = list(VALID_RECALL_FACT_TYPES)
+            # Sanitize the query at ingress: a client may serialize a half-emoji as a
+            # lone UTF-16 surrogate, which crashes downstream logging, the embedder, and
+            # the cross-encoder tokenizer with an HTTP 500 (see issue #1875). Cleaning it
+            # here protects every sink that the query flows into.
+            query = sanitize_text(query) or ""
 
-        # Filter out 'opinion' (removed fact type, silently ignore for backwards compat)
-        fact_type = [ft for ft in fact_type if ft != "opinion"]
-        if not fact_type:
-            return RecallResultModel(results=[], entities={}, chunks={})
+            # Default to all fact types if not specified
+            if fact_type is None:
+                fact_type = list(VALID_RECALL_FACT_TYPES)
 
-        # Validate fact types
-        invalid_types = set(fact_type) - VALID_RECALL_FACT_TYPES
-        if invalid_types:
-            raise ValueError(
-                f"Invalid fact type(s): {', '.join(sorted(invalid_types))}. "
-                f"Must be one of: {', '.join(sorted(VALID_RECALL_FACT_TYPES))}"
-            )
+            # Filter out 'opinion' (removed fact type, silently ignore for backwards compat)
+            fact_type = [ft for ft in fact_type if ft != "opinion"]
+            if not fact_type:
+                return RecallResultModel(results=[], entities={}, chunks={})
 
-        # Validate operation if validator is configured
-        if self._operation_validator:
-            from hindsight_api.extensions import RecallContext
+            # Validate fact types
+            invalid_types = set(fact_type) - VALID_RECALL_FACT_TYPES
+            if invalid_types:
+                raise ValueError(
+                    f"Invalid fact type(s): {', '.join(sorted(invalid_types))}. "
+                    f"Must be one of: {', '.join(sorted(VALID_RECALL_FACT_TYPES))}"
+                )
 
-            ctx = RecallContext(
-                bank_id=bank_id,
-                query=query,
-                request_context=request_context,
-                budget=budget,
-                max_tokens=max_tokens,
-                enable_trace=enable_trace,
-                fact_types=list(fact_type),
-                question_date=question_date,
-                include_entities=include_entities,
-                max_entity_tokens=max_entity_tokens,
-                include_chunks=include_chunks,
-                max_chunk_tokens=max_chunk_tokens,
-                tags=tags,
-                tags_match=tags_match,
-                tag_groups=tag_groups,
-            )
-            result = await self._validate_operation(self._operation_validator.validate_recall(ctx))
-            if result:
-                if result.tags is not None:
-                    tags = result.tags
-                if result.tags_match is not None:
-                    tags_match = result.tags_match
-                if result.tag_groups is not None:
-                    tag_groups = result.tag_groups
+            # Validate operation if validator is configured
+            if self._operation_validator:
+                from hindsight_api.extensions import RecallContext
 
-        # Map budget enum to thinking_budget number using bank-resolved config.
-        # Function "fixed" preserves legacy {LOW: 100, MID: 300, HIGH: 1000}; function "adaptive"
-        # derives from max_tokens and clamps to [recall_budget_min, recall_budget_max].
-        budget_config_dict = await self._config_resolver.get_bank_config(bank_id, request_context)
-        thinking_budget = _resolve_thinking_budget(budget_config_dict, budget, max_tokens)
-
-        # Log recall start with tags if present (skip if quiet mode for internal operations)
-        if not _quiet:
-            tags_info = f", tags={tags} ({tags_match})" if tags else ""
-            logger.info(f"[RECALL {bank_id[:8]}] Starting recall for query: {query[:50]}...{tags_info}")
-
-        # Create parent span for recall operation
-        from ..tracing import get_tracer
-
-        tracer = get_tracer()
-        # Use start_as_current_span to ensure child spans are linked properly
-        recall_span_context = tracer.start_as_current_span("hindsight.recall")
-        recall_span = recall_span_context.__enter__()
-        recall_span.set_attribute("hindsight.bank_id", bank_id)
-        recall_span.set_attribute("hindsight.query", query[:100])
-        recall_span.set_attribute("hindsight.fact_types", ",".join(fact_type))
-        recall_span.set_attribute("hindsight.thinking_budget", thinking_budget)
-        recall_span.set_attribute("hindsight.max_tokens", max_tokens)
-
-        try:
-            # Backpressure: limit concurrent recalls to prevent overwhelming the database
-            result = None
-            error_msg = None
-            semaphore_wait_start = time.time()
-            async with self._search_semaphore:
-                semaphore_wait = time.time() - semaphore_wait_start
-                # Retry loop for connection errors
-                max_retries = 3
-                for attempt in range(max_retries + 1):
-                    try:
-                        result = await self._search_with_retries(
-                            bank_id,
-                            query,
-                            fact_type,
-                            thinking_budget,
-                            max_tokens,
-                            enable_trace,
-                            question_date,
-                            include_entities,
-                            max_entity_tokens,
-                            include_chunks,
-                            max_chunk_tokens,
-                            request_context,
-                            semaphore_wait=semaphore_wait,
-                            prefer_observations=prefer_observations,
-                            tags=tags,
-                            tags_match=tags_match,
-                            tag_groups=tag_groups,
-                            created_after=created_after,
-                            created_before=created_before,
-                            min_scores=min_scores,
-                            connection_budget=_connection_budget,
-                            quiet=_quiet,
-                            include_source_facts=include_source_facts,
-                            max_source_facts_tokens=max_source_facts_tokens,
-                            max_source_facts_tokens_per_observation=max_source_facts_tokens_per_observation,
-                            reranking=reranking,
-                        )
-                        break  # Success - exit retry loop
-                    except OperationCancelledError:
-                        # Client disconnected — propagate to the HTTP layer (499);
-                        # not a failure to retry or report via the post-op hook.
-                        raise
-                    except Exception as e:
-                        # Check if it's a connection error (PG or Oracle)
-                        is_connection_error = (
-                            isinstance(e, asyncpg.TooManyConnectionsError)
-                            or isinstance(e, asyncpg.CannotConnectNowError)
-                            or (isinstance(e, asyncpg.PostgresError) and "connection" in str(e).lower())
-                            or _is_oracledb_connection_error(e)
-                        )
-
-                        if is_connection_error and attempt < max_retries:
-                            # Wait with exponential backoff before retry
-                            wait_time = 0.5 * (2**attempt)  # 0.5s, 1s, 2s
-                            logger.warning(
-                                f"Connection error on search attempt {attempt + 1}/{max_retries + 1}: {str(e)}. "
-                                f"Retrying in {wait_time:.1f}s..."
-                            )
-                            await asyncio.sleep(wait_time)
-                        else:
-                            # Not a connection error or out of retries - call post-hook and raise
-                            error_msg = str(e)
-                            if self._operation_validator:
-                                from hindsight_api.extensions.operation_validator import RecallResult
-
-                                result_ctx = RecallResult(
-                                    bank_id=bank_id,
-                                    query=query,
-                                    request_context=request_context,
-                                    budget=budget,
-                                    max_tokens=max_tokens,
-                                    enable_trace=enable_trace,
-                                    fact_types=list(fact_type),
-                                    question_date=question_date,
-                                    include_entities=include_entities,
-                                    max_entity_tokens=max_entity_tokens,
-                                    include_chunks=include_chunks,
-                                    max_chunk_tokens=max_chunk_tokens,
-                                    result=None,
-                                    success=False,
-                                    error=error_msg,
-                                )
-                                try:
-                                    await self._operation_validator.on_recall_complete(result_ctx)
-                                except Exception as hook_err:
-                                    logger.warning(f"Post-recall hook error (non-fatal): {hook_err}")
-                            raise
-                else:
-                    # Exceeded max retries
-                    error_msg = "Exceeded maximum retries for search due to connection errors."
-                    if self._operation_validator:
-                        from hindsight_api.extensions.operation_validator import RecallResult
-
-                        result_ctx = RecallResult(
-                            bank_id=bank_id,
-                            query=query,
-                            request_context=request_context,
-                            budget=budget,
-                            max_tokens=max_tokens,
-                            enable_trace=enable_trace,
-                            fact_types=list(fact_type),
-                            question_date=question_date,
-                            include_entities=include_entities,
-                            max_entity_tokens=max_entity_tokens,
-                            include_chunks=include_chunks,
-                            max_chunk_tokens=max_chunk_tokens,
-                            result=None,
-                            success=False,
-                            error=error_msg,
-                        )
-                        try:
-                            await self._operation_validator.on_recall_complete(result_ctx)
-                        except Exception as hook_err:
-                            logger.warning(f"Post-recall hook error (non-fatal): {hook_err}")
-                    raise Exception(error_msg)
-
-            # Call post-operation hook for success
-            if self._operation_validator and result is not None:
-                from hindsight_api.extensions.operation_validator import RecallResult
-
-                result_ctx = RecallResult(
+                ctx = RecallContext(
                     bank_id=bank_id,
                     query=query,
                     request_context=request_context,
@@ -4235,18 +4287,190 @@ class MemoryEngine(MemoryEngineInterface):
                     max_entity_tokens=max_entity_tokens,
                     include_chunks=include_chunks,
                     max_chunk_tokens=max_chunk_tokens,
-                    result=result,
-                    success=True,
-                    error=None,
+                    tags=tags,
+                    tags_match=tags_match,
+                    tag_groups=tag_groups,
                 )
-                try:
-                    await self._operation_validator.on_recall_complete(result_ctx)
-                except Exception as e:
-                    logger.warning(f"Post-recall hook error (non-fatal): {e}")
+                result = await self._validate_operation(self._operation_validator.validate_recall(ctx))
+                if result:
+                    if result.tags is not None:
+                        tags = result.tags
+                    if result.tags_match is not None:
+                        tags_match = result.tags_match
+                    if result.tag_groups is not None:
+                        tag_groups = result.tag_groups
 
-            return result
-        finally:
-            recall_span_context.__exit__(None, None, None)
+            # Map budget enum to thinking_budget number using bank-resolved config.
+            # Function "fixed" preserves legacy {LOW: 100, MID: 300, HIGH: 1000}; function "adaptive"
+            # derives from max_tokens and clamps to [recall_budget_min, recall_budget_max].
+            budget_config_dict = await self._config_resolver.get_bank_config(bank_id, request_context)
+            thinking_budget = _resolve_thinking_budget(budget_config_dict, budget, max_tokens)
+
+            # Log recall start with tags if present (skip if quiet mode for internal operations)
+            if not _quiet:
+                tags_info = f", tags={tags} ({tags_match})" if tags else ""
+                logger.info(f"[RECALL {bank_id[:8]}] Starting recall for query: {query[:50]}...{tags_info}")
+
+            # Create parent span for recall operation
+            from ..tracing import get_tracer
+
+            tracer = get_tracer()
+            # Use start_as_current_span to ensure child spans are linked properly
+            recall_span_context = tracer.start_as_current_span("hindsight.recall")
+            recall_span = recall_span_context.__enter__()
+            recall_span.set_attribute("hindsight.bank_id", bank_id)
+            recall_span.set_attribute("hindsight.query", query[:100])
+            recall_span.set_attribute("hindsight.fact_types", ",".join(fact_type))
+            recall_span.set_attribute("hindsight.thinking_budget", thinking_budget)
+            recall_span.set_attribute("hindsight.max_tokens", max_tokens)
+
+            try:
+                # Backpressure: limit concurrent recalls to prevent overwhelming the database
+                result = None
+                error_msg = None
+                semaphore_wait_start = time.time()
+                async with self._search_semaphore:
+                    semaphore_wait = time.time() - semaphore_wait_start
+                    # Retry loop for connection errors
+                    max_retries = 3
+                    for attempt in range(max_retries + 1):
+                        try:
+                            result = await self._search_with_retries(
+                                bank_id,
+                                query,
+                                fact_type,
+                                thinking_budget,
+                                max_tokens,
+                                enable_trace,
+                                question_date,
+                                include_entities,
+                                max_entity_tokens,
+                                include_chunks,
+                                max_chunk_tokens,
+                                request_context,
+                                semaphore_wait=semaphore_wait,
+                                prefer_observations=prefer_observations,
+                                tags=tags,
+                                tags_match=tags_match,
+                                tag_groups=tag_groups,
+                                created_after=created_after,
+                                created_before=created_before,
+                                min_scores=min_scores,
+                                connection_budget=_connection_budget,
+                                quiet=_quiet,
+                                include_source_facts=include_source_facts,
+                                max_source_facts_tokens=max_source_facts_tokens,
+                                max_source_facts_tokens_per_observation=max_source_facts_tokens_per_observation,
+                                reranking=reranking,
+                            )
+                            break  # Success - exit retry loop
+                        except OperationCancelledError:
+                            # Client disconnected — propagate to the HTTP layer (499);
+                            # not a failure to retry or report via the post-op hook.
+                            raise
+                        except Exception as e:
+                            # Check if it's a connection error (PG or Oracle)
+                            is_connection_error = (
+                                isinstance(e, asyncpg.TooManyConnectionsError)
+                                or isinstance(e, asyncpg.CannotConnectNowError)
+                                or (isinstance(e, asyncpg.PostgresError) and "connection" in str(e).lower())
+                                or _is_oracledb_connection_error(e)
+                            )
+
+                            if is_connection_error and attempt < max_retries:
+                                # Wait with exponential backoff before retry
+                                wait_time = 0.5 * (2**attempt)  # 0.5s, 1s, 2s
+                                logger.warning(
+                                    f"Connection error on search attempt {attempt + 1}/{max_retries + 1}: {str(e)}. "
+                                    f"Retrying in {wait_time:.1f}s..."
+                                )
+                                await asyncio.sleep(wait_time)
+                            else:
+                                # Not a connection error or out of retries - call post-hook and raise
+                                error_msg = str(e)
+                                if self._operation_validator:
+                                    from hindsight_api.extensions.operation_validator import RecallResult
+
+                                    result_ctx = RecallResult(
+                                        bank_id=bank_id,
+                                        query=query,
+                                        request_context=request_context,
+                                        budget=budget,
+                                        max_tokens=max_tokens,
+                                        enable_trace=enable_trace,
+                                        fact_types=list(fact_type),
+                                        question_date=question_date,
+                                        include_entities=include_entities,
+                                        max_entity_tokens=max_entity_tokens,
+                                        include_chunks=include_chunks,
+                                        max_chunk_tokens=max_chunk_tokens,
+                                        result=None,
+                                        success=False,
+                                        error=error_msg,
+                                    )
+                                    try:
+                                        await self._operation_validator.on_recall_complete(result_ctx)
+                                    except Exception as hook_err:
+                                        logger.warning(f"Post-recall hook error (non-fatal): {hook_err}")
+                                raise
+                    else:
+                        # Exceeded max retries
+                        error_msg = "Exceeded maximum retries for search due to connection errors."
+                        if self._operation_validator:
+                            from hindsight_api.extensions.operation_validator import RecallResult
+
+                            result_ctx = RecallResult(
+                                bank_id=bank_id,
+                                query=query,
+                                request_context=request_context,
+                                budget=budget,
+                                max_tokens=max_tokens,
+                                enable_trace=enable_trace,
+                                fact_types=list(fact_type),
+                                question_date=question_date,
+                                include_entities=include_entities,
+                                max_entity_tokens=max_entity_tokens,
+                                include_chunks=include_chunks,
+                                max_chunk_tokens=max_chunk_tokens,
+                                result=None,
+                                success=False,
+                                error=error_msg,
+                            )
+                            try:
+                                await self._operation_validator.on_recall_complete(result_ctx)
+                            except Exception as hook_err:
+                                logger.warning(f"Post-recall hook error (non-fatal): {hook_err}")
+                        raise Exception(error_msg)
+
+                # Call post-operation hook for success
+                if self._operation_validator and result is not None:
+                    from hindsight_api.extensions.operation_validator import RecallResult
+
+                    result_ctx = RecallResult(
+                        bank_id=bank_id,
+                        query=query,
+                        request_context=request_context,
+                        budget=budget,
+                        max_tokens=max_tokens,
+                        enable_trace=enable_trace,
+                        fact_types=list(fact_type),
+                        question_date=question_date,
+                        include_entities=include_entities,
+                        max_entity_tokens=max_entity_tokens,
+                        include_chunks=include_chunks,
+                        max_chunk_tokens=max_chunk_tokens,
+                        result=result,
+                        success=True,
+                        error=None,
+                    )
+                    try:
+                        await self._operation_validator.on_recall_complete(result_ctx)
+                    except Exception as e:
+                        logger.warning(f"Post-recall hook error (non-fatal): {e}")
+
+                return result
+            finally:
+                recall_span_context.__exit__(None, None, None)
 
     async def _search_with_retries(
         self,
@@ -8525,41 +8749,46 @@ class MemoryEngine(MemoryEngineInterface):
             create_if_missing=False and the bank does not exist.
         """
         await self._authenticate_tenant(request_context)
-        if self._operation_validator:
-            from hindsight_api.extensions import BankReadContext, BankReadOperation
+        # Route to the correct schema (primary or shared) and enforce read membership.
+        # TODO: all other bank_id-taking methods should adopt resolve_bank_target too.
+        _profile_target = await self.resolve_bank_target(bank_id, write=False)
+        bank_id = _profile_target.bank_id
+        async with self._schema_override(_profile_target.schema):
+            if self._operation_validator:
+                from hindsight_api.extensions import BankReadContext, BankReadOperation
 
-            ctx = BankReadContext(
-                bank_id=bank_id, operation=BankReadOperation.GET_BANK_PROFILE, request_context=request_context
-            )
-            await self._validate_operation(self._operation_validator.validate_bank_read(ctx))
-        backend = await self._get_backend()
-        if not create_if_missing:
-            existing = await bank_utils.get_bank_profile_if_exists(backend, bank_id)
-            if existing is None:
-                return None
-            profile, created = existing, False
-        else:
-            result = await bank_utils.get_or_create_bank_profile(backend, bank_id)
-            profile, created = result.profile, result.created
+                ctx = BankReadContext(
+                    bank_id=bank_id, operation=BankReadOperation.GET_BANK_PROFILE, request_context=request_context
+                )
+                await self._validate_operation(self._operation_validator.validate_bank_read(ctx))
+            backend = await self._get_backend()
+            if not create_if_missing:
+                existing = await bank_utils.get_bank_profile_if_exists(backend, bank_id)
+                if existing is None:
+                    return None
+                profile, created = existing, False
+            else:
+                result = await bank_utils.get_or_create_bank_profile(backend, bank_id)
+                profile, created = result.profile, result.created
 
-        # Apply HINDSIGHT_API_DEFAULT_BANK_TEMPLATE to freshly-created banks. Done
-        # before reading the resolved config below so the template's overrides
-        # (e.g. reflect_mission, dispositions) are visible on this very call.
-        if created:
-            await self._apply_default_bank_template(bank_id, request_context)
+            # Apply HINDSIGHT_API_DEFAULT_BANK_TEMPLATE to freshly-created banks. Done
+            # before reading the resolved config below so the template's overrides
+            # (e.g. reflect_mission, dispositions) are visible on this very call.
+            if created:
+                await self._apply_default_bank_template(bank_id, request_context)
 
-        # reflect_mission and disposition in config take precedence over the legacy DB columns
-        config_dict = await self._config_resolver.get_bank_config(bank_id, request_context)
-        db_disp = profile["disposition"]
-        db_disp_dict = db_disp.model_dump() if hasattr(db_disp, "model_dump") else dict(db_disp)
-        resolved = _overlay_bank_config_disposition_mission(db_disp_dict, profile["mission"], config_dict)
+            # reflect_mission and disposition in config take precedence over the legacy DB columns
+            config_dict = await self._config_resolver.get_bank_config(bank_id, request_context)
+            db_disp = profile["disposition"]
+            db_disp_dict = db_disp.model_dump() if hasattr(db_disp, "model_dump") else dict(db_disp)
+            resolved = _overlay_bank_config_disposition_mission(db_disp_dict, profile["mission"], config_dict)
 
-        return {
-            "bank_id": bank_id,
-            "name": profile["name"],
-            "disposition": resolved.disposition,
-            "mission": resolved.mission,
-        }
+            return {
+                "bank_id": bank_id,
+                "name": profile["name"],
+                "disposition": resolved.disposition,
+                "mission": resolved.mission,
+            }
 
     async def _ensure_bank_exists(
         self,
@@ -8759,7 +8988,18 @@ class MemoryEngine(MemoryEngineInterface):
         request_context: "RequestContext",
     ) -> list[dict[str, Any]]:
         """
-        List all agents in the system.
+        List all banks visible to the caller, spanning their private schema and any
+        readable shared schemas.
+
+        For each readable schema (primary + shared), ``bank_utils.list_banks`` is
+        called with ``_current_schema`` set to that schema so every query targets
+        exactly one schema (SQL-safety invariant preserved). Banks from shared
+        schemas have their ``bank_id`` prefixed with ``"{schema}/"`` so callers
+        receive qualified ids they can round-trip back to the engine.
+
+        Shared schemas that are not yet migrated (physical tables absent) are
+        skipped gracefully — a ``UndefinedTableError`` / ``relation does not exist``
+        error is caught per schema and logged at WARNING level.
 
         Args:
             request_context: Request context for authentication.
@@ -8767,9 +9007,52 @@ class MemoryEngine(MemoryEngineInterface):
         Returns:
             List of dicts with bank_id, name, disposition, mission, created_at, updated_at
         """
+        from . import shared_schemas as _shared_schemas
+
         await self._authenticate_tenant(request_context)
         await self._get_backend()
-        banks = await bank_utils.list_banks(self._backend)
+
+        readable = _readable_schemas.get()  # extra shared schemas (excludes primary)
+
+        # --- Collect banks from every readable schema ---
+        all_banks: list[dict[str, Any]] = []
+
+        # 1. Primary (private) schema — bare bank_ids, no prefix.
+        all_banks.extend(await bank_utils.list_banks(self._backend))
+
+        # 2. Shared schemas — only those that are registered AND physically migrated.
+        for schema in sorted(readable):  # sorted for deterministic ordering
+            # Skip if not registered (defensive; membership should imply registration).
+            try:
+                if not await _shared_schemas.shared_schema_exists(self._backend, schema):
+                    logger.debug("list_banks: skipping unregistered shared schema %s", schema)
+                    continue
+            except Exception as e:
+                logger.warning("list_banks: error checking shared schema %s: %s", schema, e)
+                continue
+
+            # Query the shared schema; skip gracefully if not yet migrated.
+            try:
+                async with self._schema_override(schema):
+                    schema_banks = await bank_utils.list_banks(self._backend)
+            except Exception as e:
+                err_str = str(e).lower()
+                if "does not exist" in err_str or "undefined" in err_str or "relation" in err_str:
+                    logger.warning(
+                        "list_banks: shared schema %s not yet migrated, skipping: %s", schema, e
+                    )
+                    continue
+                raise
+
+            # Prefix bank_ids with the schema so callers can round-trip them.
+            for bank in schema_banks:
+                bank = dict(bank)
+                bank["bank_id"] = f"{schema}/{bank['bank_id']}"
+                all_banks.append(bank)
+
+        banks = all_banks
+
+        # --- OperationValidator filter (unchanged contract) ---
         if self._operation_validator:
             from hindsight_api.extensions import BankListContext
 
@@ -8777,17 +9060,49 @@ class MemoryEngine(MemoryEngineInterface):
                 BankListContext(banks=banks, request_context=request_context)
             )
             banks = result.banks
-        # Overlay resolved bank config (reflect_mission + disposition_*) on top of the
-        # legacy banks.disposition / banks.mission columns, mirroring get_bank_profile so
-        # the list and get paths return identical disposition + mission for a bank.
-        # Resolve every bank's config in one batch (single config-column query + a single
-        # tenant-config resolve) rather than one round-trip per bank.
-        configs = await self._config_resolver.get_bank_configs([bank["bank_id"] for bank in banks], request_context)
+
+        # --- Config overlay ---
+        # Group banks by their schema so we can resolve config per-schema-group.
+        # Private banks (bare ids) use the primary schema; shared banks (qualified
+        # ids) use their schema. This ensures fq_table() in _load_bank_configs
+        # targets the right schema for each group.
+        #
+        # Strategy: group by schema, override _current_schema per group, resolve
+        # configs, then merge back. This avoids N+1 round-trips while keeping the
+        # SQL-safety invariant (one schema per query).
+        from collections import defaultdict
+
+        schema_groups: dict[str | None, list[dict[str, Any]]] = defaultdict(list)
+        for bank in banks:
+            bid = bank["bank_id"]
+            if "/" in bid:
+                schema_part = bid.split("/", 1)[0]
+                schema_groups[schema_part].append(bank)
+            else:
+                schema_groups[None].append(bank)  # None → primary schema
+
+        all_configs: dict[str, dict[str, Any]] = {}
+
+        for schema_key, group_banks in schema_groups.items():
+            # Bare bank_ids for config lookup (strip schema prefix for shared banks).
+            bare_ids = [
+                b["bank_id"].split("/", 1)[1] if "/" in b["bank_id"] else b["bank_id"]
+                for b in group_banks
+            ]
+            async with self._schema_override(schema_key):
+                group_configs = await self._config_resolver.get_bank_configs(bare_ids, request_context)
+            # Re-key by the qualified bank_id so the merge below works.
+            for bank in group_banks:
+                bid = bank["bank_id"]
+                bare = bid.split("/", 1)[1] if "/" in bid else bid
+                all_configs[bid] = group_configs.get(bare, {})
+
         for bank in banks:
             resolved = _overlay_bank_config_disposition_mission(
-                bank["disposition"], bank["mission"], configs.get(bank["bank_id"], {})
+                bank["disposition"], bank["mission"], all_configs.get(bank["bank_id"], {})
             )
             bank["disposition"], bank["mission"] = resolved.disposition, resolved.mission
+
         return banks
 
     # ==================== Reflect Methods ====================
@@ -8871,432 +9186,439 @@ class MemoryEngine(MemoryEngineInterface):
         # Authenticate tenant and set schema in context (for fq_table())
         await self._authenticate_tenant(request_context)
 
-        # Cooperative cancellation checkpoint: if the client already disconnected
-        # while this request waited to be scheduled, abort before doing any work
-        # (issue #2122). The agentic loop re-checks between iterations, and the
-        # nested recall tool checks at its own stage boundaries.
-        request_context.raise_if_cancelled()
+        # Route to the correct schema (primary or shared) and enforce read membership.
+        # reflect is read-only (it synthesizes from stored memories, persists nothing).
+        # TODO: all other bank_id-taking methods should adopt resolve_bank_target too.
+        _reflect_target = await self.resolve_bank_target(bank_id, write=False)
+        bank_id = _reflect_target.bank_id
+        async with self._schema_override(_reflect_target.schema):
 
-        # Validate operation if validator is configured
-        if self._operation_validator:
-            from hindsight_api.extensions import ReflectContext
+            # Cooperative cancellation checkpoint: if the client already disconnected
+            # while this request waited to be scheduled, abort before doing any work
+            # (issue #2122). The agentic loop re-checks between iterations, and the
+            # nested recall tool checks at its own stage boundaries.
+            request_context.raise_if_cancelled()
 
-            ctx = ReflectContext(
-                bank_id=bank_id,
-                query=query,
-                request_context=request_context,
-                budget=budget,
-                context=context,
-            )
-            await self._validate_operation(self._operation_validator.validate_reflect(ctx))
-
-        reflect_start = time.time()
-        reflect_id = f"{bank_id[:8]}-{int(time.time() * 1000) % 100000}"
-        tags_info = f", tags={tags} ({tags_match})" if tags else ""
-        logger.info(f"[REFLECT {reflect_id}] Starting agentic reflect for query: {query[:50]}...{tags_info}")
-
-        # Get bank profile for agent identity
-        profile = await self.get_bank_profile(bank_id, request_context=request_context)
-
-        # NOTE: Mental models are NOT pre-loaded to keep the initial prompt small.
-        # The agent can call lookup() to list available models if needed.
-        # This is critical for banks with many mental models to avoid huge prompts.
-
-        resolved_reflect_config = await self._config_resolver.resolve_full_config(bank_id, request_context)
-
-        # Compute max iterations based on budget
-        config = get_config()
-        base_max_iterations = config.reflect_max_iterations
-        # Budget multipliers: low=0.5x, mid=1x, high=2x
-        budget_multipliers = {Budget.LOW: 0.5, Budget.MID: 1.0, Budget.HIGH: 2.0}
-        effective_budget = budget or Budget.LOW
-        max_iterations = max(1, int(base_max_iterations * budget_multipliers.get(effective_budget, 1.0)))
-        max_context_tokens = config.reflect_max_context_tokens
-        wall_timeout = config.reflect_wall_timeout
-
-        # Run agentic loop - acquire connections only when needed for DB operations
-        # (not held during LLM calls which can be slow)
-        backend = await self._get_backend()
-
-        # Pull only the consolidation freshness — get_bank_stats also computes
-        # link aggregations that reflect() does not use and which can take many
-        # seconds on large banks.
-        freshness = await self.get_bank_freshness(bank_id, request_context=request_context)
-        last_consolidated_at = freshness.get("last_consolidated_at")
-        pending_consolidation = freshness.get("pending_consolidation", 0)
-
-        # Create tool callbacks that acquire connections only when needed
-        from .retain import embedding_utils
-
-        async def search_mental_models_fn(q: str, max_results: int = 5) -> dict[str, Any]:
-            # Generate embedding for the query
-            embeddings = await embedding_utils.generate_embeddings_batch(
-                self.embeddings,
-                [q],
-                input_type="query",
-            )
-            query_embedding = embeddings[0]
-            async with backend.acquire() as conn:
-                return await tool_search_mental_models(
-                    self,
-                    conn,
-                    bank_id,
-                    q,
-                    query_embedding,
-                    max_results=max_results,
-                    tags=tags,
-                    tags_match=tags_match,
-                    tag_groups=tag_groups,
-                    exclude_ids=exclude_mental_model_ids,
-                )
-
-        # Get reflect source facts config (hierarchical: env → tenant → bank)
-        config_dict = await self._config_resolver.get_bank_config(bank_id, request_context)
-        reflect_source_facts_max_tokens = config_dict.get(
-            "reflect_source_facts_max_tokens", DEFAULT_REFLECT_SOURCE_FACTS_MAX_TOKENS
-        )
-
-        # Resolve recall overrides: caller arg (e.g. mental model trigger) → bank config → env default
-        effective_recall_include_chunks = (
-            recall_include_chunks
-            if recall_include_chunks is not None
-            else config_dict.get("recall_include_chunks", DEFAULT_RECALL_INCLUDE_CHUNKS)
-        )
-        # With document text storage disabled there is no raw chunk text, so
-        # fetching chunks would only attach empty strings to every recall
-        # result. Force it off (pairs with excluding the expand tool below).
-        if not get_config().store_document_text:
-            effective_recall_include_chunks = False
-        effective_recall_max_tokens = (
-            recall_max_tokens_override
-            if recall_max_tokens_override is not None
-            else config_dict.get("recall_max_tokens", DEFAULT_RECALL_MAX_TOKENS)
-        )
-        effective_recall_chunks_max_tokens = (
-            recall_chunks_max_tokens_override
-            if recall_chunks_max_tokens_override is not None
-            else config_dict.get("recall_chunks_max_tokens", DEFAULT_RECALL_CHUNKS_MAX_TOKENS)
-        )
-
-        async def search_observations_fn(q: str, max_tokens: int = 5000) -> dict[str, Any]:
-            return await tool_search_observations(
-                self,
-                bank_id,
-                q,
-                request_context,
-                max_tokens=max_tokens,
-                tags=tags,
-                tags_match=tags_match,
-                tag_groups=tag_groups,
-                last_consolidated_at=last_consolidated_at,
-                pending_consolidation=pending_consolidation,
-                source_facts_max_tokens=reflect_source_facts_max_tokens,
-                created_after=created_after,
-                created_before=created_before,
-            )
-
-        # Determine which tools to enable based on fact_types and exclude_mental_models
-        include_observations = fact_types is None or "observation" in fact_types
-        recall_fact_types = [ft for ft in (fact_types or ["world", "experience"]) if ft in ("world", "experience")]
-        include_recall = bool(recall_fact_types)
-
-        # Defaults are bound at closure-definition time (re-evaluated on each
-        # reflect_async call), so per-bank/per-trigger overrides apply when the
-        # agent invokes recall without explicit token args.
-        async def recall_fn(
-            q: str,
-            max_tokens: int = effective_recall_max_tokens,
-            max_chunk_tokens: int = effective_recall_chunks_max_tokens,
-        ) -> dict[str, Any]:
-            return await tool_recall(
-                self,
-                bank_id,
-                q,
-                request_context,
-                max_tokens=max_tokens,
-                tags=tags,
-                tags_match=tags_match,
-                tag_groups=tag_groups,
-                max_chunk_tokens=max_chunk_tokens,
-                fact_types=recall_fact_types if fact_types is not None else None,
-                include_chunks=effective_recall_include_chunks,
-                created_after=created_after,
-                created_before=created_before,
-            )
-
-        async def expand_fn(memory_ids: list[str], depth: str) -> dict[str, Any]:
-            async with backend.acquire() as conn:
-                return await tool_expand(conn, bank_id, memory_ids, depth)
-
-        # Load directives from the dedicated directives table
-        # Directives are hard rules that must be followed in all responses
-        # Use isolation_mode=True to prevent tag-scoped directives from leaking into untagged operations
-        # Use the same tags_match as the reflect request so directives respect the same scoping rules
-        directives_raw = await self.list_directives(
-            bank_id=bank_id,
-            tags=tags,
-            tags_match=tags_match,
-            tag_groups=tag_groups,
-            active_only=True,
-            request_context=request_context,
-            isolation_mode=True,
-        )
-        directives = directives_raw
-        if directives:
-            logger.info(f"[REFLECT {reflect_id}] Loaded {len(directives)} directives")
-
-        # Check if the bank has any mental models (skip check if all mental models are excluded)
-        has_mental_models = False
-        if not exclude_mental_models:
-            async with backend.acquire() as conn:
-                mental_model_count = await conn.fetchval(
-                    f"SELECT COUNT(*) FROM {fq_table('mental_models')} WHERE bank_id = $1",
-                    bank_id,
-                )
-            has_mental_models = mental_model_count > 0
-            if has_mental_models:
-                logger.info(f"[REFLECT {reflect_id}] Bank has {mental_model_count} mental models")
-
-        # Run the agent with parent span for reflect operation (skip if called from another operation)
-        if not _skip_span:
-            span_context = create_operation_span("reflect", bank_id)
-            span_context.__enter__()
-        else:
-            span_context = None
-
-        try:
-            try:
-                agent_result = await asyncio.wait_for(
-                    run_reflect_agent(
-                        llm_config=self._reflect_llm_config.with_config(
-                            resolved_reflect_config, bank_id=bank_id, operation=_operation_label
-                        ),
-                        bank_id=bank_id,
-                        query=query,
-                        bank_profile=profile,
-                        search_mental_models_fn=search_mental_models_fn,
-                        search_observations_fn=search_observations_fn,
-                        recall_fn=recall_fn,
-                        expand_fn=expand_fn,
-                        context=context,
-                        max_iterations=max_iterations,
-                        max_tokens=max_tokens,
-                        response_schema=response_schema,
-                        directives=directives,
-                        has_mental_models=has_mental_models,
-                        include_observations=include_observations,
-                        include_recall=include_recall,
-                        budget=effective_budget,
-                        max_context_tokens=max_context_tokens,
-                        llm_output_language=getattr(resolved_reflect_config, "llm_output_language", None),
-                        cancel_check=request_context.raise_if_cancelled,
-                    ),
-                    timeout=wall_timeout,
-                )
-            except asyncio.TimeoutError:
-                total_time = time.time() - reflect_start
-                logger.error(
-                    "[REFLECT %s] Wall-clock timeout after %.1fs (limit: %ss) for query: %.50s...",
-                    reflect_id,
-                    total_time,
-                    wall_timeout,
-                    query,
-                )
-                raise TimeoutError(
-                    f"Reflect operation timed out after {wall_timeout} seconds. "
-                    f"Consider reducing the budget or simplifying the query."
-                )
-
-            total_time = time.time() - reflect_start
-            logger.info(
-                "[REFLECT %s] Complete: %d chars, %d iterations, %d tool calls | %.3fs",
-                reflect_id,
-                len(agent_result.text),
-                agent_result.iterations,
-                agent_result.tools_called,
-                total_time,
-            )
-
-            # Convert agent tool trace to ToolCallTrace objects
-            tool_trace_result = [
-                ToolCallTrace(
-                    tool=tc.tool,
-                    reason=tc.reason,
-                    input=tc.input,
-                    output=tc.output,
-                    duration_ms=tc.duration_ms,
-                    iteration=tc.iteration,
-                )
-                for tc in agent_result.tool_trace
-            ]
-
-            # Convert agent LLM trace to LLMCallTrace objects
-            llm_trace_result = [
-                LLMCallTrace(scope=lc.scope, duration_ms=lc.duration_ms) for lc in agent_result.llm_trace
-            ]
-
-            # Extract memories and observations from tool outputs - only include those the agent actually used
-            # agent_result.used_memory_ids / used_observation_ids contain validated IDs from the done action
-            used_memory_ids_set = set(agent_result.used_memory_ids) if agent_result.used_memory_ids else set()
-            used_observation_ids_set = (
-                set(agent_result.used_observation_ids) if agent_result.used_observation_ids else set()
-            )
-            # based_on stores facts, mental models, and directives
-            # Note: directives list stores raw directive dicts (not MemoryFact), which will be converted to Directive objects
-            based_on: dict[str, list[MemoryFact] | list[dict[str, Any]]] = {
-                "world": [],
-                "experience": [],
-                "opinion": [],
-                "observation": [],
-                "mental-models": [],
-                "directives": [],
-            }
-            seen_memory_ids: set[str] = set()
-            for tc in agent_result.tool_trace:
-                if tc.tool == "recall" and "memories" in tc.output:
-                    for memory_data in tc.output["memories"]:
-                        memory_id = memory_data.get("id")
-                        # Only include memories that the agent declared as used (or all if none specified)
-                        if memory_id and memory_id not in seen_memory_ids:
-                            if used_memory_ids_set and memory_id not in used_memory_ids_set:
-                                continue  # Skip memories not actually used by the agent
-                            seen_memory_ids.add(memory_id)
-                            fact_type = memory_data.get("fact_type", "world")
-                            if fact_type in based_on:
-                                based_on[fact_type].append(
-                                    MemoryFact(
-                                        id=memory_id,
-                                        text=memory_data.get("text", ""),
-                                        fact_type=fact_type,
-                                        context=memory_data.get("context"),
-                                        occurred_start=memory_data.get("occurred_start"),
-                                        occurred_end=memory_data.get("occurred_end"),
-                                    )
-                                )
-                elif tc.tool == "search_observations" and "observations" in tc.output:
-                    for obs_data in tc.output["observations"]:
-                        obs_id = obs_data.get("id")
-                        if obs_id and obs_id not in seen_memory_ids:
-                            if used_observation_ids_set and obs_id not in used_observation_ids_set:
-                                continue  # Skip observations not actually used by the agent
-                            seen_memory_ids.add(obs_id)
-                            based_on["observation"].append(MemoryFact(**obs_data))
-
-            # Extract mental models from tool outputs - only include models the agent actually used
-            # agent_result.used_mental_model_ids contains validated IDs from the done action
-            used_model_ids_set = (
-                set(agent_result.used_mental_model_ids) if agent_result.used_mental_model_ids else set()
-            )
-            based_on["mental-models"] = []
-            seen_model_ids: set[str] = set()
-            for tc in agent_result.tool_trace:
-                if tc.tool == "get_mental_model":
-                    # Single model lookup (with full details)
-                    if tc.output.get("found") and "model" in tc.output:
-                        model = tc.output["model"]
-                        model_id = model.get("id")
-                        if model_id and model_id not in seen_model_ids:
-                            # Only include models that the agent declared as used (or all if none specified)
-                            if used_model_ids_set and model_id not in used_model_ids_set:
-                                continue  # Skip models not actually used by the agent
-                            seen_model_ids.add(model_id)
-                            # Add to based_on as MemoryFact with type "mental-models"
-                            model_name = model.get("name", "")
-                            model_content = model.get("content", "")
-                            based_on["mental-models"].append(
-                                MemoryFact(
-                                    id=model_id,
-                                    text=f"{model_name}: {model_content}",
-                                    fact_type="mental-models",
-                                    context=f"{model.get('type', 'concept')} ({model.get('subtype', 'structural')})",
-                                    occurred_start=None,
-                                    occurred_end=None,
-                                )
-                            )
-                elif tc.tool == "search_mental_models":
-                    # Search mental models - include all returned models (filtered by used_model_ids_set if specified)
-                    for model in tc.output.get("mental_models", []):
-                        model_id = model.get("id")
-                        if model_id and model_id not in seen_model_ids:
-                            # Only include models that the agent declared as used (or all if none specified)
-                            if used_model_ids_set and model_id not in used_model_ids_set:
-                                continue  # Skip models not actually used by the agent
-                            seen_model_ids.add(model_id)
-                            # Add to based_on as MemoryFact with type "mental-models"
-                            model_name = model.get("name", "")
-                            model_content = model.get("content", "")
-                            based_on["mental-models"].append(
-                                MemoryFact(
-                                    id=model_id,
-                                    text=f"{model_name}: {model_content}",
-                                    fact_type="mental-models",
-                                    context=f"{model.get('type', 'concept')} ({model.get('subtype', 'structural')})",
-                                    occurred_start=None,
-                                    occurred_end=None,
-                                )
-                            )
-
-            # Add directives to based_on["directives"]
-            # Store raw directive dicts (with id, name, content) for http.py to convert to ReflectDirective
-            for directive_raw in directives_raw:
-                based_on["directives"].append(
-                    {
-                        "id": directive_raw["id"],
-                        "name": directive_raw["name"],
-                        "content": directive_raw["content"],
-                    }
-                )
-
-            # Build directives_applied from agent result
-            from hindsight_api.engine.response_models import DirectiveRef
-
-            directives_applied_result = [
-                DirectiveRef(id=d.id, name=d.name, content=d.content) for d in agent_result.directives_applied
-            ]
-
-            # Convert agent usage to TokenUsage format
-            from hindsight_api.engine.response_models import TokenUsage
-
-            usage = TokenUsage(
-                input_tokens=agent_result.usage.input_tokens,
-                output_tokens=agent_result.usage.output_tokens,
-                total_tokens=agent_result.usage.total_tokens,
-            )
-
-            # Return response (compatible with existing API)
-            result = ReflectResult(
-                text=agent_result.text,
-                based_on=based_on,
-                structured_output=agent_result.structured_output,
-                usage=usage,
-                tool_trace=tool_trace_result,
-                llm_trace=llm_trace_result,
-                directives_applied=directives_applied_result,
-            )
-
-            # Call post-operation hook if validator is configured
+            # Validate operation if validator is configured
             if self._operation_validator:
-                from hindsight_api.extensions.operation_validator import ReflectResultContext
+                from hindsight_api.extensions import ReflectContext
 
-                result_ctx = ReflectResultContext(
+                ctx = ReflectContext(
                     bank_id=bank_id,
                     query=query,
                     request_context=request_context,
                     budget=budget,
                     context=context,
-                    result=result,
-                    success=True,
-                    error=None,
                 )
-                try:
-                    await self._operation_validator.on_reflect_complete(result_ctx)
-                except Exception as e:
-                    logger.warning(f"Post-reflect hook error (non-fatal): {e}")
+                await self._validate_operation(self._operation_validator.validate_reflect(ctx))
 
-            return result
-        finally:
-            if span_context:
-                span_context.__exit__(None, None, None)
+            reflect_start = time.time()
+            reflect_id = f"{bank_id[:8]}-{int(time.time() * 1000) % 100000}"
+            tags_info = f", tags={tags} ({tags_match})" if tags else ""
+            logger.info(f"[REFLECT {reflect_id}] Starting agentic reflect for query: {query[:50]}...{tags_info}")
+
+            # Get bank profile for agent identity
+            profile = await self.get_bank_profile(bank_id, request_context=request_context)
+
+            # NOTE: Mental models are NOT pre-loaded to keep the initial prompt small.
+            # The agent can call lookup() to list available models if needed.
+            # This is critical for banks with many mental models to avoid huge prompts.
+
+            resolved_reflect_config = await self._config_resolver.resolve_full_config(bank_id, request_context)
+
+            # Compute max iterations based on budget
+            config = get_config()
+            base_max_iterations = config.reflect_max_iterations
+            # Budget multipliers: low=0.5x, mid=1x, high=2x
+            budget_multipliers = {Budget.LOW: 0.5, Budget.MID: 1.0, Budget.HIGH: 2.0}
+            effective_budget = budget or Budget.LOW
+            max_iterations = max(1, int(base_max_iterations * budget_multipliers.get(effective_budget, 1.0)))
+            max_context_tokens = config.reflect_max_context_tokens
+            wall_timeout = config.reflect_wall_timeout
+
+            # Run agentic loop - acquire connections only when needed for DB operations
+            # (not held during LLM calls which can be slow)
+            backend = await self._get_backend()
+
+            # Pull only the consolidation freshness — get_bank_stats also computes
+            # link aggregations that reflect() does not use and which can take many
+            # seconds on large banks.
+            freshness = await self.get_bank_freshness(bank_id, request_context=request_context)
+            last_consolidated_at = freshness.get("last_consolidated_at")
+            pending_consolidation = freshness.get("pending_consolidation", 0)
+
+            # Create tool callbacks that acquire connections only when needed
+            from .retain import embedding_utils
+
+            async def search_mental_models_fn(q: str, max_results: int = 5) -> dict[str, Any]:
+                # Generate embedding for the query
+                embeddings = await embedding_utils.generate_embeddings_batch(
+                    self.embeddings,
+                    [q],
+                    input_type="query",
+                )
+                query_embedding = embeddings[0]
+                async with backend.acquire() as conn:
+                    return await tool_search_mental_models(
+                        self,
+                        conn,
+                        bank_id,
+                        q,
+                        query_embedding,
+                        max_results=max_results,
+                        tags=tags,
+                        tags_match=tags_match,
+                        tag_groups=tag_groups,
+                        exclude_ids=exclude_mental_model_ids,
+                    )
+
+            # Get reflect source facts config (hierarchical: env → tenant → bank)
+            config_dict = await self._config_resolver.get_bank_config(bank_id, request_context)
+            reflect_source_facts_max_tokens = config_dict.get(
+                "reflect_source_facts_max_tokens", DEFAULT_REFLECT_SOURCE_FACTS_MAX_TOKENS
+            )
+
+            # Resolve recall overrides: caller arg (e.g. mental model trigger) → bank config → env default
+            effective_recall_include_chunks = (
+                recall_include_chunks
+                if recall_include_chunks is not None
+                else config_dict.get("recall_include_chunks", DEFAULT_RECALL_INCLUDE_CHUNKS)
+            )
+            # With document text storage disabled there is no raw chunk text, so
+            # fetching chunks would only attach empty strings to every recall
+            # result. Force it off (pairs with excluding the expand tool below).
+            if not get_config().store_document_text:
+                effective_recall_include_chunks = False
+            effective_recall_max_tokens = (
+                recall_max_tokens_override
+                if recall_max_tokens_override is not None
+                else config_dict.get("recall_max_tokens", DEFAULT_RECALL_MAX_TOKENS)
+            )
+            effective_recall_chunks_max_tokens = (
+                recall_chunks_max_tokens_override
+                if recall_chunks_max_tokens_override is not None
+                else config_dict.get("recall_chunks_max_tokens", DEFAULT_RECALL_CHUNKS_MAX_TOKENS)
+            )
+
+            async def search_observations_fn(q: str, max_tokens: int = 5000) -> dict[str, Any]:
+                return await tool_search_observations(
+                    self,
+                    bank_id,
+                    q,
+                    request_context,
+                    max_tokens=max_tokens,
+                    tags=tags,
+                    tags_match=tags_match,
+                    tag_groups=tag_groups,
+                    last_consolidated_at=last_consolidated_at,
+                    pending_consolidation=pending_consolidation,
+                    source_facts_max_tokens=reflect_source_facts_max_tokens,
+                    created_after=created_after,
+                    created_before=created_before,
+                )
+
+            # Determine which tools to enable based on fact_types and exclude_mental_models
+            include_observations = fact_types is None or "observation" in fact_types
+            recall_fact_types = [ft for ft in (fact_types or ["world", "experience"]) if ft in ("world", "experience")]
+            include_recall = bool(recall_fact_types)
+
+            # Defaults are bound at closure-definition time (re-evaluated on each
+            # reflect_async call), so per-bank/per-trigger overrides apply when the
+            # agent invokes recall without explicit token args.
+            async def recall_fn(
+                q: str,
+                max_tokens: int = effective_recall_max_tokens,
+                max_chunk_tokens: int = effective_recall_chunks_max_tokens,
+            ) -> dict[str, Any]:
+                return await tool_recall(
+                    self,
+                    bank_id,
+                    q,
+                    request_context,
+                    max_tokens=max_tokens,
+                    tags=tags,
+                    tags_match=tags_match,
+                    tag_groups=tag_groups,
+                    max_chunk_tokens=max_chunk_tokens,
+                    fact_types=recall_fact_types if fact_types is not None else None,
+                    include_chunks=effective_recall_include_chunks,
+                    created_after=created_after,
+                    created_before=created_before,
+                )
+
+            async def expand_fn(memory_ids: list[str], depth: str) -> dict[str, Any]:
+                async with backend.acquire() as conn:
+                    return await tool_expand(conn, bank_id, memory_ids, depth)
+
+            # Load directives from the dedicated directives table
+            # Directives are hard rules that must be followed in all responses
+            # Use isolation_mode=True to prevent tag-scoped directives from leaking into untagged operations
+            # Use the same tags_match as the reflect request so directives respect the same scoping rules
+            directives_raw = await self.list_directives(
+                bank_id=bank_id,
+                tags=tags,
+                tags_match=tags_match,
+                tag_groups=tag_groups,
+                active_only=True,
+                request_context=request_context,
+                isolation_mode=True,
+            )
+            directives = directives_raw
+            if directives:
+                logger.info(f"[REFLECT {reflect_id}] Loaded {len(directives)} directives")
+
+            # Check if the bank has any mental models (skip check if all mental models are excluded)
+            has_mental_models = False
+            if not exclude_mental_models:
+                async with backend.acquire() as conn:
+                    mental_model_count = await conn.fetchval(
+                        f"SELECT COUNT(*) FROM {fq_table('mental_models')} WHERE bank_id = $1",
+                        bank_id,
+                    )
+                has_mental_models = mental_model_count > 0
+                if has_mental_models:
+                    logger.info(f"[REFLECT {reflect_id}] Bank has {mental_model_count} mental models")
+
+            # Run the agent with parent span for reflect operation (skip if called from another operation)
+            if not _skip_span:
+                span_context = create_operation_span("reflect", bank_id)
+                span_context.__enter__()
+            else:
+                span_context = None
+
+            try:
+                try:
+                    agent_result = await asyncio.wait_for(
+                        run_reflect_agent(
+                            llm_config=self._reflect_llm_config.with_config(
+                                resolved_reflect_config, bank_id=bank_id, operation=_operation_label
+                            ),
+                            bank_id=bank_id,
+                            query=query,
+                            bank_profile=profile,
+                            search_mental_models_fn=search_mental_models_fn,
+                            search_observations_fn=search_observations_fn,
+                            recall_fn=recall_fn,
+                            expand_fn=expand_fn,
+                            context=context,
+                            max_iterations=max_iterations,
+                            max_tokens=max_tokens,
+                            response_schema=response_schema,
+                            directives=directives,
+                            has_mental_models=has_mental_models,
+                            include_observations=include_observations,
+                            include_recall=include_recall,
+                            budget=effective_budget,
+                            max_context_tokens=max_context_tokens,
+                            llm_output_language=getattr(resolved_reflect_config, "llm_output_language", None),
+                            cancel_check=request_context.raise_if_cancelled,
+                        ),
+                        timeout=wall_timeout,
+                    )
+                except asyncio.TimeoutError:
+                    total_time = time.time() - reflect_start
+                    logger.error(
+                        "[REFLECT %s] Wall-clock timeout after %.1fs (limit: %ss) for query: %.50s...",
+                        reflect_id,
+                        total_time,
+                        wall_timeout,
+                        query,
+                    )
+                    raise TimeoutError(
+                        f"Reflect operation timed out after {wall_timeout} seconds. "
+                        f"Consider reducing the budget or simplifying the query."
+                    )
+
+                total_time = time.time() - reflect_start
+                logger.info(
+                    "[REFLECT %s] Complete: %d chars, %d iterations, %d tool calls | %.3fs",
+                    reflect_id,
+                    len(agent_result.text),
+                    agent_result.iterations,
+                    agent_result.tools_called,
+                    total_time,
+                )
+
+                # Convert agent tool trace to ToolCallTrace objects
+                tool_trace_result = [
+                    ToolCallTrace(
+                        tool=tc.tool,
+                        reason=tc.reason,
+                        input=tc.input,
+                        output=tc.output,
+                        duration_ms=tc.duration_ms,
+                        iteration=tc.iteration,
+                    )
+                    for tc in agent_result.tool_trace
+                ]
+
+                # Convert agent LLM trace to LLMCallTrace objects
+                llm_trace_result = [
+                    LLMCallTrace(scope=lc.scope, duration_ms=lc.duration_ms) for lc in agent_result.llm_trace
+                ]
+
+                # Extract memories and observations from tool outputs - only include those the agent actually used
+                # agent_result.used_memory_ids / used_observation_ids contain validated IDs from the done action
+                used_memory_ids_set = set(agent_result.used_memory_ids) if agent_result.used_memory_ids else set()
+                used_observation_ids_set = (
+                    set(agent_result.used_observation_ids) if agent_result.used_observation_ids else set()
+                )
+                # based_on stores facts, mental models, and directives
+                # Note: directives list stores raw directive dicts (not MemoryFact), which will be converted to Directive objects
+                based_on: dict[str, list[MemoryFact] | list[dict[str, Any]]] = {
+                    "world": [],
+                    "experience": [],
+                    "opinion": [],
+                    "observation": [],
+                    "mental-models": [],
+                    "directives": [],
+                }
+                seen_memory_ids: set[str] = set()
+                for tc in agent_result.tool_trace:
+                    if tc.tool == "recall" and "memories" in tc.output:
+                        for memory_data in tc.output["memories"]:
+                            memory_id = memory_data.get("id")
+                            # Only include memories that the agent declared as used (or all if none specified)
+                            if memory_id and memory_id not in seen_memory_ids:
+                                if used_memory_ids_set and memory_id not in used_memory_ids_set:
+                                    continue  # Skip memories not actually used by the agent
+                                seen_memory_ids.add(memory_id)
+                                fact_type = memory_data.get("fact_type", "world")
+                                if fact_type in based_on:
+                                    based_on[fact_type].append(
+                                        MemoryFact(
+                                            id=memory_id,
+                                            text=memory_data.get("text", ""),
+                                            fact_type=fact_type,
+                                            context=memory_data.get("context"),
+                                            occurred_start=memory_data.get("occurred_start"),
+                                            occurred_end=memory_data.get("occurred_end"),
+                                        )
+                                    )
+                    elif tc.tool == "search_observations" and "observations" in tc.output:
+                        for obs_data in tc.output["observations"]:
+                            obs_id = obs_data.get("id")
+                            if obs_id and obs_id not in seen_memory_ids:
+                                if used_observation_ids_set and obs_id not in used_observation_ids_set:
+                                    continue  # Skip observations not actually used by the agent
+                                seen_memory_ids.add(obs_id)
+                                based_on["observation"].append(MemoryFact(**obs_data))
+
+                # Extract mental models from tool outputs - only include models the agent actually used
+                # agent_result.used_mental_model_ids contains validated IDs from the done action
+                used_model_ids_set = (
+                    set(agent_result.used_mental_model_ids) if agent_result.used_mental_model_ids else set()
+                )
+                based_on["mental-models"] = []
+                seen_model_ids: set[str] = set()
+                for tc in agent_result.tool_trace:
+                    if tc.tool == "get_mental_model":
+                        # Single model lookup (with full details)
+                        if tc.output.get("found") and "model" in tc.output:
+                            model = tc.output["model"]
+                            model_id = model.get("id")
+                            if model_id and model_id not in seen_model_ids:
+                                # Only include models that the agent declared as used (or all if none specified)
+                                if used_model_ids_set and model_id not in used_model_ids_set:
+                                    continue  # Skip models not actually used by the agent
+                                seen_model_ids.add(model_id)
+                                # Add to based_on as MemoryFact with type "mental-models"
+                                model_name = model.get("name", "")
+                                model_content = model.get("content", "")
+                                based_on["mental-models"].append(
+                                    MemoryFact(
+                                        id=model_id,
+                                        text=f"{model_name}: {model_content}",
+                                        fact_type="mental-models",
+                                        context=f"{model.get('type', 'concept')} ({model.get('subtype', 'structural')})",
+                                        occurred_start=None,
+                                        occurred_end=None,
+                                    )
+                                )
+                    elif tc.tool == "search_mental_models":
+                        # Search mental models - include all returned models (filtered by used_model_ids_set if specified)
+                        for model in tc.output.get("mental_models", []):
+                            model_id = model.get("id")
+                            if model_id and model_id not in seen_model_ids:
+                                # Only include models that the agent declared as used (or all if none specified)
+                                if used_model_ids_set and model_id not in used_model_ids_set:
+                                    continue  # Skip models not actually used by the agent
+                                seen_model_ids.add(model_id)
+                                # Add to based_on as MemoryFact with type "mental-models"
+                                model_name = model.get("name", "")
+                                model_content = model.get("content", "")
+                                based_on["mental-models"].append(
+                                    MemoryFact(
+                                        id=model_id,
+                                        text=f"{model_name}: {model_content}",
+                                        fact_type="mental-models",
+                                        context=f"{model.get('type', 'concept')} ({model.get('subtype', 'structural')})",
+                                        occurred_start=None,
+                                        occurred_end=None,
+                                    )
+                                )
+
+                # Add directives to based_on["directives"]
+                # Store raw directive dicts (with id, name, content) for http.py to convert to ReflectDirective
+                for directive_raw in directives_raw:
+                    based_on["directives"].append(
+                        {
+                            "id": directive_raw["id"],
+                            "name": directive_raw["name"],
+                            "content": directive_raw["content"],
+                        }
+                    )
+
+                # Build directives_applied from agent result
+                from hindsight_api.engine.response_models import DirectiveRef
+
+                directives_applied_result = [
+                    DirectiveRef(id=d.id, name=d.name, content=d.content) for d in agent_result.directives_applied
+                ]
+
+                # Convert agent usage to TokenUsage format
+                from hindsight_api.engine.response_models import TokenUsage
+
+                usage = TokenUsage(
+                    input_tokens=agent_result.usage.input_tokens,
+                    output_tokens=agent_result.usage.output_tokens,
+                    total_tokens=agent_result.usage.total_tokens,
+                )
+
+                # Return response (compatible with existing API)
+                result = ReflectResult(
+                    text=agent_result.text,
+                    based_on=based_on,
+                    structured_output=agent_result.structured_output,
+                    usage=usage,
+                    tool_trace=tool_trace_result,
+                    llm_trace=llm_trace_result,
+                    directives_applied=directives_applied_result,
+                )
+
+                # Call post-operation hook if validator is configured
+                if self._operation_validator:
+                    from hindsight_api.extensions.operation_validator import ReflectResultContext
+
+                    result_ctx = ReflectResultContext(
+                        bank_id=bank_id,
+                        query=query,
+                        request_context=request_context,
+                        budget=budget,
+                        context=context,
+                        result=result,
+                        success=True,
+                        error=None,
+                    )
+                    try:
+                        await self._operation_validator.on_reflect_complete(result_ctx)
+                    except Exception as e:
+                        logger.warning(f"Post-reflect hook error (non-fatal): {e}")
+
+                return result
+            finally:
+                if span_context:
+                    span_context.__exit__(None, None, None)
 
     async def list_entities(
         self,
@@ -12778,3 +13100,223 @@ class MemoryEngine(MemoryEngineInterface):
             result_metadata={"mental_model_id": mental_model_id, "name": mental_model["name"]},
             dedupe_by_bank=False,
         )
+
+    # ------------------------------------------------------------------
+    # Shared-schema management (admin API surface)
+    # ------------------------------------------------------------------
+
+    async def list_visible_shared_schemas(self, *, request_context: "RequestContext") -> dict:
+        """Return shared schemas visible to the caller plus admin capability flag.
+
+        Authenticates the caller (sets readable/writable context vars), then asks
+        the tenant extension which shared schemas the caller may access.  Each
+        returned schema is cross-referenced against the ``public.shared_schemas``
+        registry to attach ``display_name`` and ``created_at``; schemas that are
+        not registered are silently skipped (membership without registration is a
+        misconfiguration, not a caller error).
+
+        Admin detection: ``is_admin`` from
+        :mod:`hindsight_api.extensions.builtin.github_role_validator` reads the
+        ``gh_<id>:<role>`` encoding written by the GitHub tenant extension.  For
+        deployments that do not use that extension the tenant_id will not carry a
+        role token and ``is_admin`` returns ``False`` — which is the correct
+        safe-default (no admin capability exposed to unknown callers).
+
+        Returns:
+            {
+                "private_schema": str,          # caller's primary (private) schema
+                "shared": [                     # shared schemas the caller can see
+                    {
+                        "schema_name": str,
+                        "display_name": str | None,
+                        "created_at": str | None,
+                        "writable": bool,
+                    },
+                    ...
+                ],
+                "can_create": bool,             # True only for admin callers
+            }
+        """
+        from hindsight_api.extensions.builtin.github_role_validator import is_admin
+
+        from . import shared_schemas as _shared_schemas
+
+        await self._authenticate_tenant(request_context)
+        backend = await self._get_backend()
+
+        private_schema = get_current_schema()
+
+        # Ask the tenant extension which shared schemas this caller may access.
+        ext_schemas = await self._tenant_extension.list_shared_schemas(request_context)
+
+        shared_out: list[dict] = []
+        for ext_schema in ext_schemas:
+            record = await _shared_schemas.get_shared_schema(backend, ext_schema.schema)
+            if record is None:
+                # Not registered — skip (membership without registration is a
+                # misconfiguration; don't surface it to the caller).
+                logger.debug(
+                    "list_visible_shared_schemas: skipping unregistered schema %s", ext_schema.schema
+                )
+                continue
+            shared_out.append(
+                {
+                    "schema_name": record.schema_name,
+                    "display_name": record.display_name,
+                    "created_at": record.created_at,
+                    "writable": ext_schema.writable,
+                }
+            )
+
+        can_create = is_admin(request_context.tenant_id)
+
+        return {
+            "private_schema": private_schema,
+            "shared": shared_out,
+            "can_create": can_create,
+        }
+
+    async def create_shared_schema(
+        self,
+        *,
+        schema_name: str,
+        display_name: str | None,
+        request_context: "RequestContext",
+    ) -> dict:
+        """Provision and register a new shared schema.
+
+        Admin-only operation.  Validates the name, runs migrations to create the
+        physical schema, then inserts a row in ``public.shared_schemas``.
+
+        Args:
+            schema_name:  Must start with ``shared_`` and contain only lowercase
+                          letters, digits, and underscores.
+            display_name: Optional human-readable label (defaults to schema_name).
+            request_context: Authenticated request context.
+
+        Returns:
+            The newly created :class:`SharedSchemaRecord` as a dict.
+
+        Raises:
+            OperationValidationError(403): If the caller is not an admin.
+            SharedSchemaValidationError:   If ``schema_name`` is invalid (caught
+                                           by the HTTP layer → 400).
+        """
+        from hindsight_api.extensions import OperationValidationError
+        from hindsight_api.extensions.builtin.github_role_validator import is_admin
+
+        from . import shared_schemas as _shared_schemas
+
+        await self._authenticate_tenant(request_context)
+
+        if not is_admin(request_context.tenant_id):
+            raise OperationValidationError("Only admins may create shared schemas", status_code=403)
+
+        # Validate name (raises SharedSchemaValidationError on bad input).
+        _shared_schemas.validate_shared_schema_name(schema_name)
+
+        # Provision the physical schema (idempotent Alembic migration).
+        await self._ext_ctx.run_migration(schema_name)
+
+        # Register in the public registry.
+        backend = await self._get_backend()
+        record = await _shared_schemas.create_shared_schema(
+            backend,
+            schema_name,
+            display_name,
+            created_by=request_context.tenant_id,
+        )
+        return record.to_dict()
+
+    async def delete_shared_schema(
+        self,
+        *,
+        schema_name: str,
+        request_context: "RequestContext",
+    ) -> dict:
+        """Deregister a shared schema (does NOT drop the physical schema or data).
+
+        Admin-only operation.  Removes the row from ``public.shared_schemas`` so
+        the schema is no longer visible or accessible via qualified bank ids.  The
+        underlying PostgreSQL schema and all its tables are left intact.
+
+        Args:
+            schema_name:    The registered shared schema name to deregister.
+            request_context: Authenticated request context.
+
+        Returns:
+            {"schema_name": str, "deregistered": True}
+
+        Raises:
+            OperationValidationError(403): If the caller is not an admin.
+            OperationValidationError(404): If the schema is not registered.
+        """
+        from hindsight_api.extensions import OperationValidationError
+        from hindsight_api.extensions.builtin.github_role_validator import is_admin
+
+        from . import shared_schemas as _shared_schemas
+
+        await self._authenticate_tenant(request_context)
+
+        if not is_admin(request_context.tenant_id):
+            raise OperationValidationError("Only admins may delete shared schemas", status_code=403)
+
+        backend = await self._get_backend()
+        removed = await _shared_schemas.delete_shared_schema(backend, schema_name)
+        if not removed:
+            raise OperationValidationError(
+                f"Shared schema '{schema_name}' not found", status_code=404
+            )
+
+        return {"schema_name": schema_name, "deregistered": True}
+
+    async def drop_shared_schema(
+        self,
+        *,
+        schema_name: str,
+        request_context: "RequestContext",
+    ) -> dict:
+        """Destructively drop a shared schema: deregister AND delete all its data.
+
+        Admin-only, irreversible. Deregisters the schema from
+        ``public.shared_schemas`` and runs ``DROP SCHEMA ... CASCADE``, permanently
+        removing every bank, memory and document stored in it. The registry-row
+        removal and the schema drop happen in one transaction.
+
+        Args:
+            schema_name:     The registered shared schema name to drop.
+            request_context: Authenticated request context.
+
+        Returns:
+            {"schema_name": str, "dropped": True}
+
+        Raises:
+            OperationValidationError(403): If the caller is not an admin.
+            OperationValidationError(404): If the schema is not registered.
+            OperationValidationError(400): If the name is not a valid shared schema.
+        """
+        from hindsight_api.extensions import OperationValidationError
+        from hindsight_api.extensions.builtin.github_role_validator import is_admin
+
+        from . import shared_schemas as _shared_schemas
+
+        await self._authenticate_tenant(request_context)
+
+        if not is_admin(request_context.tenant_id):
+            raise OperationValidationError("Only admins may drop shared schemas", status_code=403)
+
+        backend = await self._get_backend()
+        try:
+            dropped = await _shared_schemas.drop_shared_schema(backend, schema_name)
+        except _shared_schemas.SharedSchemaValidationError as e:
+            raise OperationValidationError(str(e), status_code=400)
+
+        if not dropped:
+            raise OperationValidationError(
+                f"Shared schema '{schema_name}' not found", status_code=404
+            )
+
+        # Forget any bootstrap cache entry so a future same-named schema re-migrates.
+        self._bootstrapped_shared_schemas.discard(schema_name)
+
+        return {"schema_name": schema_name, "dropped": True}

@@ -38,6 +38,9 @@ import type {
   CreateOrUpdateBankData,
   CreateOrUpdateBankErrors,
   CreateOrUpdateBankResponses,
+  CreateSharedSchemaData,
+  CreateSharedSchemaErrors,
+  CreateSharedSchemaResponses,
   CreateWebhookData,
   CreateWebhookErrors,
   CreateWebhookResponses,
@@ -53,9 +56,15 @@ import type {
   DeleteMentalModelData,
   DeleteMentalModelErrors,
   DeleteMentalModelResponses,
+  DeleteSharedSchemaData,
+  DeleteSharedSchemaErrors,
+  DeleteSharedSchemaResponses,
   DeleteWebhookData,
   DeleteWebhookErrors,
   DeleteWebhookResponses,
+  DropSharedSchemaData,
+  DropSharedSchemaErrors,
+  DropSharedSchemaResponses,
   DryRunExtractMemoriesData,
   DryRunExtractMemoriesErrors,
   DryRunExtractMemoriesResponses,
@@ -158,6 +167,9 @@ import type {
   ListOperationsData,
   ListOperationsErrors,
   ListOperationsResponses,
+  ListSharedSchemasData,
+  ListSharedSchemasErrors,
+  ListSharedSchemasResponses,
   ListTagsData,
   ListTagsErrors,
   ListTagsResponses,
@@ -1432,3 +1444,66 @@ export const llmRequestStats = <ThrowOnError extends boolean = false>(
     url: "/v1/default/banks/{bank_id}/llm-requests/stats",
     ...options,
   });
+
+/**
+ * List shared schemas visible to the caller
+ *
+ * Returns the caller's private schema name, the shared schemas they may access (with read/write flag), and whether they have permission to create new shared schemas. Shared schemas are common memory-bank namespaces (e.g. per-codebase) that multiple users read from and write to alongside their own private schema.
+ */
+export const listSharedSchemas = <ThrowOnError extends boolean = false>(
+  options?: Options<ListSharedSchemasData, ThrowOnError>
+) =>
+  (options?.client ?? client).get<
+    ListSharedSchemasResponses,
+    ListSharedSchemasErrors,
+    ThrowOnError
+  >({ url: "/v1/shared/schemas", ...options });
+
+/**
+ * Create a shared schema
+ *
+ * Provision and register a new shared memory-bank schema. Admin-only: returns 403 if the caller does not have admin role. The schema name must start with 'shared_' and contain only lowercase letters, digits, and underscores (e.g. 'shared_my_codebase'). Returns 400 if the name is invalid, 403 if not admin.
+ */
+export const createSharedSchema = <ThrowOnError extends boolean = false>(
+  options: Options<CreateSharedSchemaData, ThrowOnError>
+) =>
+  (options.client ?? client).post<
+    CreateSharedSchemaResponses,
+    CreateSharedSchemaErrors,
+    ThrowOnError
+  >({
+    url: "/v1/shared/schemas",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
+ * Deregister a shared schema
+ *
+ * Remove a shared schema from the registry. Admin-only: returns 403 if the caller does not have admin role. Returns 404 if the schema is not registered. NOTE: This deregisters the schema only — the underlying PostgreSQL schema and all its data are preserved.
+ */
+export const deleteSharedSchema = <ThrowOnError extends boolean = false>(
+  options: Options<DeleteSharedSchemaData, ThrowOnError>
+) =>
+  (options.client ?? client).delete<
+    DeleteSharedSchemaResponses,
+    DeleteSharedSchemaErrors,
+    ThrowOnError
+  >({ url: "/v1/shared/schemas/{schema_name}", ...options });
+
+/**
+ * Permanently delete a shared schema and all its data
+ *
+ * DESTRUCTIVE and IRREVERSIBLE. Deregisters the shared schema AND drops the underlying PostgreSQL schema with CASCADE, permanently deleting every bank, memory and document stored in it. Admin-only: returns 403 if the caller does not have admin role. Returns 404 if the schema is not registered. Prefer DELETE /v1/shared/schemas/{schema_name} (deregister-only) unless you explicitly intend to erase the data.
+ */
+export const dropSharedSchema = <ThrowOnError extends boolean = false>(
+  options: Options<DropSharedSchemaData, ThrowOnError>
+) =>
+  (options.client ?? client).delete<
+    DropSharedSchemaResponses,
+    DropSharedSchemaErrors,
+    ThrowOnError
+  >({ url: "/v1/shared/schemas/{schema_name}/data", ...options });

@@ -64,7 +64,7 @@ from hindsight_api.extensions.builtin.oidc_tenant import (
     Identity,
     OidcTenantExtension,
 )
-from hindsight_api.extensions.tenant import AuthenticationError
+from hindsight_api.extensions.tenant import AuthenticationError, SharedSchema
 from hindsight_api.models import RequestContext
 
 logger = logging.getLogger(__name__)
@@ -145,6 +145,14 @@ class GitHubTenantExtension(OidcTenantExtension):
 
         # token-hash -> (expires_at, role). Avoids a GitHub round-trip per request.
         self._role_cache: dict[str, tuple[float, str]] = {}
+
+        # Shared schema mapping for GitHub: team-slug → shared schema name.
+        # Config key: shared_schema_map (env: HINDSIGHT_API_TENANT_SHARED_SCHEMA_MAP)
+        # Format: "team-slug:shared_a,other-team:shared_b"
+        # Reuses the base _parse_shared_schema_map; stored separately for clarity.
+        self.shared_team_map: dict[str, str] = self._parse_shared_schema_map(
+            config.get("shared_schema_map", "")
+        )
 
     @staticmethod
     def _parse_teams(raw: str | None) -> set[str]:
@@ -317,3 +325,39 @@ class GitHubTenantExtension(OidcTenantExtension):
             return set(_MEMBER_ALLOWED_FIELDS)
         # viewer or unknown -> no config writes
         return set()
+
+    # ------------------------------------------------------------------
+    # Shared schema resolution (team-based, overrides OIDC group-based)
+    # ------------------------------------------------------------------
+
+    async def _shared_schemas_for_request(
+        self,
+        token: str,
+        identity: Identity,
+        context: RequestContext,
+    ) -> set[str]:
+        """Resolve shared schemas from GitHub team membership.
+
+        Overrides the base OIDC implementation (which reads JWT group claims).
+        GitHub uses opaque tokens, so group membership comes from the team slugs
+        already fetched during role resolution (via ``_fetch_user_team_slugs``).
+
+        The team slugs are re-fetched here if not cached; in practice
+        ``_load_roles`` → ``_resolve_role`` → ``_fetch_user_team_slugs`` runs
+        first (same request), so the role cache is warm and the teams call is
+        served from the role cache's side-effect. We call ``_fetch_user_team_slugs``
+        directly to keep the logic self-contained; the HTTP result is cached by
+        the role cache TTL at the token level.
+        """
+        if not self.shared_team_map:
+            return set()
+        teams = await self._fetch_user_team_slugs(token)
+        return {schema for team, schema in self.shared_team_map.items() if team in teams}
+
+    async def list_shared_schemas(self, context: RequestContext) -> list[SharedSchema]:
+        """Return shared schemas for the authenticated caller (GitHub variant).
+
+        Delegates to the base implementation which reads from ``_shared_cache``
+        populated during :meth:`authenticate`.
+        """
+        return await super().list_shared_schemas(context)

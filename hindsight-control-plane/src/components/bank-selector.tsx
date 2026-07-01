@@ -42,6 +42,7 @@ import {
   ChevronRight,
   LogOut,
   Copy,
+  Users,
 } from "lucide-react";
 import { toast } from "sonner";
 import { useTheme } from "@/lib/theme-context";
@@ -60,6 +61,7 @@ import {
 import { Switch } from "@/components/ui/switch";
 import { cn } from "@/lib/utils";
 import type { BankInfo } from "@/lib/bank-context";
+import { SharedSchemasDialog } from "@/components/shared-schemas-dialog";
 
 function formatCompact(n: number): string {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(n >= 10_000_000 ? 0 : 1)}M`;
@@ -94,6 +96,7 @@ function BankSelectorInner() {
   const tNavBank = useTranslations("nav.bank");
   const tCommon = useTranslations("common");
   const tAddDocument = useTranslations("addDocument");
+  const tShared = useTranslations("sharedSchemas");
   const { currentBank, setCurrentBank, banks, bankInfos, banksLoading, loadBanks } = useBank();
   const { theme, toggleTheme } = useTheme();
   const { features } = useFeatures();
@@ -105,6 +108,7 @@ function BankSelectorInner() {
   const [useTemplate, setUseTemplate] = React.useState(false);
   const [templateJson, setTemplateJson] = React.useState("");
   const [templateError, setTemplateError] = React.useState<string | null>(null);
+  const [sharedSchemasOpen, setSharedSchemasOpen] = React.useState(false);
 
   // Document creation state
   const [docDialogOpen, setDocDialogOpen] = React.useState(false);
@@ -180,6 +184,16 @@ function BankSelectorInner() {
       return bTime.localeCompare(aTime);
     });
   }, [bankInfos]);
+
+  // Shared banks are qualified as "schema/bank_id"; personal banks have no "/".
+  const ownBanks = React.useMemo(
+    () => sortedBanks.filter((b) => !b.bank_id.includes("/")),
+    [sortedBanks]
+  );
+  const sharedBanks = React.useMemo(
+    () => sortedBanks.filter((b) => b.bank_id.includes("/")),
+    [sortedBanks]
+  );
 
   const maxFactCount = React.useMemo(
     () => Math.max(1, ...sortedBanks.map((b) => b.fact_count)),
@@ -474,6 +488,82 @@ function BankSelectorInner() {
     }
   };
 
+  const renderBankItem = (bank: BankInfo) => {
+    const barPct = (bank.fact_count / maxFactCount) * 100;
+    const isSelected = currentBank === bank.bank_id;
+    const slashIndex = bank.bank_id.indexOf("/");
+    const isShared = slashIndex !== -1;
+    const schemaPrefix = isShared ? bank.bank_id.slice(0, slashIndex) : "";
+    const bankLabel = isShared ? bank.bank_id.slice(slashIndex + 1) : bank.bank_id;
+    return (
+      <CommandItem
+        key={bank.bank_id}
+        value={bank.bank_id}
+        onSelect={(value) => {
+          setCurrentBank(value);
+          setOpen(false);
+          const view = searchParams.get("view") || "data";
+          const subTab = searchParams.get("subTab");
+          const queryString = subTab ? `?view=${view}&subTab=${subTab}` : `?view=${view}`;
+          router.push(bankRoute(value, queryString));
+        }}
+        className="relative overflow-hidden py-2.5 mb-0.5 group"
+      >
+        {/* Background bar — proportional to memory count */}
+        <div
+          className="absolute inset-y-0 left-0 bg-primary/15 dark:bg-primary/20 rounded-[inherit] transition-all"
+          style={{ width: `${barPct}%` }}
+        />
+        <div className="relative flex items-center w-full gap-2">
+          <Check className={cn("h-4 w-4 shrink-0", isSelected ? "opacity-100" : "opacity-0")} />
+          {isShared && (
+            <span
+              className="shrink-0 rounded bg-primary/10 px-1.5 py-0.5 text-[10px] font-medium text-primary"
+              title={schemaPrefix}
+            >
+              {schemaPrefix}
+            </span>
+          )}
+          <span className="truncate flex-1 font-medium" title={bank.bank_id}>
+            {bankLabel}
+          </span>
+          <button
+            type="button"
+            aria-label={tNavBank("copyName")}
+            title={tNavBank("copyName")}
+            className="inline-flex h-6 w-6 items-center justify-center rounded hover:bg-accent-foreground/10 opacity-0 group-hover:opacity-100 focus:opacity-100 transition-opacity shrink-0"
+            onMouseDown={(e) => {
+              // Stop cmdk from intercepting before onClick fires.
+              e.stopPropagation();
+              e.preventDefault();
+            }}
+            onClick={(e) => {
+              e.stopPropagation();
+              navigator.clipboard.writeText(bank.bank_id).then(
+                () => toast.success(tNavBank("copied")),
+                () => toast.error(tNavBank("copied"))
+              );
+            }}
+          >
+            <Copy className="h-3.5 w-3.5" />
+          </button>
+          <span className="shrink-0 tabular-nums text-[11px] text-muted-foreground/70">
+            {bank.fact_count > 0 ? (
+              <>
+                {formatCompact(bank.fact_count)}
+                <span className="ml-1.5 text-muted-foreground/40">
+                  {bank.last_document_at ? formatTimeAgo(bank.last_document_at) : ""}
+                </span>
+              </>
+            ) : (
+              <span className="italic text-muted-foreground/40">empty</span>
+            )}
+          </span>
+        </div>
+      </CommandItem>
+    );
+  };
+
   return (
     <div className="bg-card text-card-foreground px-5 py-3 border-b-4 border-primary-gradient">
       <div className="flex items-center gap-4 text-sm">
@@ -523,82 +613,18 @@ function BankSelectorInner() {
                     tNavBank("empty")
                   )}
                 </CommandEmpty>
-                <CommandGroup>
-                  {sortedBanks.map((bank) => {
-                    const barPct = (bank.fact_count / maxFactCount) * 100;
-                    const isSelected = currentBank === bank.bank_id;
-                    return (
-                      <CommandItem
-                        key={bank.bank_id}
-                        value={bank.bank_id}
-                        onSelect={(value) => {
-                          setCurrentBank(value);
-                          setOpen(false);
-                          const view = searchParams.get("view") || "data";
-                          const subTab = searchParams.get("subTab");
-                          const queryString = subTab
-                            ? `?view=${view}&subTab=${subTab}`
-                            : `?view=${view}`;
-                          router.push(bankRoute(value, queryString));
-                        }}
-                        className="relative overflow-hidden py-2.5 mb-0.5 group"
-                      >
-                        {/* Background bar — proportional to memory count */}
-                        <div
-                          className="absolute inset-y-0 left-0 bg-primary/15 dark:bg-primary/20 rounded-[inherit] transition-all"
-                          style={{ width: `${barPct}%` }}
-                        />
-                        <div className="relative flex items-center w-full gap-2">
-                          <Check
-                            className={cn(
-                              "h-4 w-4 shrink-0",
-                              isSelected ? "opacity-100" : "opacity-0"
-                            )}
-                          />
-                          <span className="truncate flex-1 font-medium" title={bank.bank_id}>
-                            {bank.bank_id}
-                          </span>
-                          <button
-                            type="button"
-                            aria-label={tNavBank("copyName")}
-                            title={tNavBank("copyName")}
-                            className="inline-flex h-6 w-6 items-center justify-center rounded hover:bg-accent-foreground/10 opacity-0 group-hover:opacity-100 focus:opacity-100 transition-opacity shrink-0"
-                            onMouseDown={(e) => {
-                              // Stop cmdk from intercepting before onClick fires.
-                              e.stopPropagation();
-                              e.preventDefault();
-                            }}
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              navigator.clipboard.writeText(bank.bank_id).then(
-                                () => toast.success(tNavBank("copied")),
-                                () => toast.error(tNavBank("copied"))
-                              );
-                            }}
-                          >
-                            <Copy className="h-3.5 w-3.5" />
-                          </button>
-                          <span className="shrink-0 tabular-nums text-[11px] text-muted-foreground/70">
-                            {bank.fact_count > 0 ? (
-                              <>
-                                {formatCompact(bank.fact_count)}
-                                <span className="ml-1.5 text-muted-foreground/40">
-                                  {bank.last_document_at
-                                    ? formatTimeAgo(bank.last_document_at)
-                                    : ""}
-                                </span>
-                              </>
-                            ) : (
-                              <span className="italic text-muted-foreground/40">empty</span>
-                            )}
-                          </span>
-                        </div>
-                      </CommandItem>
-                    );
-                  })}
-                </CommandGroup>
+                {ownBanks.length > 0 && (
+                  <CommandGroup heading={tShared("yourBanks")}>
+                    {ownBanks.map((bank) => renderBankItem(bank))}
+                  </CommandGroup>
+                )}
+                {sharedBanks.length > 0 && (
+                  <CommandGroup heading={tShared("sharedBanks")}>
+                    {sharedBanks.map((bank) => renderBankItem(bank))}
+                  </CommandGroup>
+                )}
               </CommandList>
-              {/* Footer: Create new bank */}
+              {/* Footer: Create new bank + manage shared schemas */}
               <div className="border-t border-border p-1">
                 <button
                   className="w-full flex items-center gap-2 px-2 py-2 text-sm rounded-md hover:bg-accent transition-colors text-muted-foreground hover:text-foreground"
@@ -609,6 +635,16 @@ function BankSelectorInner() {
                 >
                   <Plus className="h-4 w-4" />
                   <span>{tNavBank("create")}</span>
+                </button>
+                <button
+                  className="w-full flex items-center gap-2 px-2 py-2 text-sm rounded-md hover:bg-accent transition-colors text-muted-foreground hover:text-foreground"
+                  onClick={() => {
+                    setOpen(false);
+                    setSharedSchemasOpen(true);
+                  }}
+                >
+                  <Users className="h-4 w-4" />
+                  <span>{tShared("manage")}</span>
                 </button>
               </div>
             </Command>
@@ -770,6 +806,12 @@ function BankSelectorInner() {
             </DialogFooter>
           </DialogContent>
         </Dialog>
+
+        <SharedSchemasDialog
+          open={sharedSchemasOpen}
+          onOpenChange={setSharedSchemasOpen}
+          onChanged={loadBanks}
+        />
 
         <Dialog open={docDialogOpen} onOpenChange={setDocDialogOpen}>
           <DialogContent className="sm:max-w-[750px] max-h-[90vh] flex flex-col">

@@ -12,7 +12,7 @@ from hindsight_api.extensions.builtin.oidc_tenant import (
     Identity,
     OidcTenantExtension,
 )
-from hindsight_api.extensions.tenant import AuthenticationError, Tenant, TenantContext, TenantExtension
+from hindsight_api.extensions.tenant import AuthenticationError, SharedSchema, Tenant, TenantContext, TenantExtension
 from hindsight_api.models import RequestContext
 
 
@@ -169,3 +169,125 @@ class TestAuthenticate:
         await ext.authenticate(RequestContext(api_key="a" * 40))
         tenants = await ext.list_tenants()
         assert tenants == [Tenant(schema="user_u1")]
+
+    @pytest.mark.asyncio
+    async def test_no_shared_schemas_by_default(self):
+        """Without shared_schema_map, readable/writable schemas are empty."""
+        ext = _make_extension()
+        ext._http_client = AsyncMock()
+        ext._resolve_identity = AsyncMock(return_value=Identity(subject="u1", claims={}))
+        mock_ctx = MagicMock()
+        mock_ctx.run_migration = AsyncMock()
+        ext.set_context(mock_ctx)
+
+        result = await ext.authenticate(RequestContext(api_key="a" * 40))
+        assert result.readable_schemas == set()
+        assert result.writable_schemas == set()
+
+    @pytest.mark.asyncio
+    async def test_tenant_context_readable_writable_populated(self):
+        """authenticate() populates readable_schemas and writable_schemas from group claims."""
+        ext = _make_extension(shared_schema_map="eng:shared_eng,data:shared_data")
+        ext._http_client = AsyncMock()
+        ext._resolve_identity = AsyncMock(
+            return_value=Identity(subject="u1", claims={"groups": ["eng", "other"]})
+        )
+        mock_ctx = MagicMock()
+        mock_ctx.run_migration = AsyncMock()
+        ext.set_context(mock_ctx)
+
+        result = await ext.authenticate(RequestContext(api_key="a" * 40))
+        assert result.readable_schemas == {"shared_eng"}
+        assert result.writable_schemas == {"shared_eng"}
+
+    @pytest.mark.asyncio
+    async def test_list_shared_schemas_after_authenticate(self):
+        """list_shared_schemas returns SharedSchema objects matching the cache."""
+        ext = _make_extension(shared_schema_map="eng:shared_eng,data:shared_data")
+        ext._http_client = AsyncMock()
+        ext._resolve_identity = AsyncMock(
+            return_value=Identity(subject="u1", claims={"groups": ["eng", "data"]})
+        )
+        mock_ctx = MagicMock()
+        mock_ctx.run_migration = AsyncMock()
+        ext.set_context(mock_ctx)
+
+        await ext.authenticate(RequestContext(api_key="a" * 40))
+        schemas = await ext.list_shared_schemas(RequestContext(api_key="a" * 40))
+        schema_names = {s.schema for s in schemas}
+        assert schema_names == {"shared_eng", "shared_data"}
+        assert all(isinstance(s, SharedSchema) for s in schemas)
+        assert all(s.writable for s in schemas)
+
+    @pytest.mark.asyncio
+    async def test_list_shared_schemas_empty_when_no_groups_match(self):
+        """list_shared_schemas returns [] when user has no matching groups."""
+        ext = _make_extension(shared_schema_map="eng:shared_eng")
+        ext._http_client = AsyncMock()
+        ext._resolve_identity = AsyncMock(
+            return_value=Identity(subject="u1", claims={"groups": ["unrelated"]})
+        )
+        mock_ctx = MagicMock()
+        mock_ctx.run_migration = AsyncMock()
+        ext.set_context(mock_ctx)
+
+        await ext.authenticate(RequestContext(api_key="a" * 40))
+        schemas = await ext.list_shared_schemas(RequestContext(api_key="a" * 40))
+        assert schemas == []
+
+
+class TestSharedSchemaMapParsing:
+    def test_parses_valid_map(self):
+        ext = _make_extension(shared_schema_map="eng:shared_eng,data:shared_data")
+        assert ext.shared_schema_map == {"eng": "shared_eng", "data": "shared_data"}
+
+    def test_empty_map(self):
+        ext = _make_extension()
+        assert ext.shared_schema_map == {}
+
+    def test_skips_malformed_no_colon(self):
+        ext = _make_extension(shared_schema_map="eng_shared_eng,data:shared_data")
+        # "eng_shared_eng" has no colon → skipped
+        assert ext.shared_schema_map == {"data": "shared_data"}
+
+    def test_skips_empty_entries(self):
+        ext = _make_extension(shared_schema_map=",data:shared_data,")
+        assert ext.shared_schema_map == {"data": "shared_data"}
+
+    def test_rejects_invalid_schema_name(self):
+        with pytest.raises(ValueError, match="shared_"):
+            _make_extension(shared_schema_map="eng:not_a_shared_schema")
+
+    def test_rejects_schema_without_prefix(self):
+        with pytest.raises(ValueError):
+            _make_extension(shared_schema_map="eng:user_eng")
+
+
+class TestGroupsFromClaims:
+    def test_list_claim(self):
+        ext = _make_extension()
+        groups = ext._groups_from_claims({"groups": ["eng", "data"]})
+        assert groups == {"eng", "data"}
+
+    def test_space_delimited_string(self):
+        ext = _make_extension()
+        groups = ext._groups_from_claims({"groups": "eng data"})
+        assert groups == {"eng", "data"}
+
+    def test_comma_delimited_string(self):
+        ext = _make_extension()
+        groups = ext._groups_from_claims({"groups": "eng,data"})
+        assert groups == {"eng", "data"}
+
+    def test_missing_claim(self):
+        ext = _make_extension()
+        assert ext._groups_from_claims({}) == set()
+
+    def test_custom_claim_name(self):
+        ext = _make_extension(shared_group_claim="roles")
+        groups = ext._groups_from_claims({"roles": ["admin", "member"]})
+        assert groups == {"admin", "member"}
+
+    def test_none_claim_value(self):
+        ext = _make_extension()
+        assert ext._groups_from_claims({"groups": None}) == set()

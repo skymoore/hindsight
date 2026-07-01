@@ -13,7 +13,7 @@ from hindsight_api.extensions.builtin.github_tenant import (
     encode_tenant_id,
     parse_role_from_tenant_id,
 )
-from hindsight_api.extensions.tenant import AuthenticationError, TenantContext, TenantExtension
+from hindsight_api.extensions.tenant import AuthenticationError, SharedSchema, TenantContext, TenantExtension
 from hindsight_api.models import RequestContext
 
 
@@ -230,3 +230,125 @@ class TestAllowedConfigFields:
         ext = _make_extension()
         ctx = RequestContext(api_key="x", tenant_id=None)
         assert await ext.get_allowed_config_fields(ctx, "bank") == set()
+
+
+class TestSharedSchemaMapParsing:
+    def test_parses_valid_team_map(self):
+        ext = _make_extension(shared_schema_map="platform-admins:shared_platform,engineering:shared_eng")
+        assert ext.shared_team_map == {
+            "platform-admins": "shared_platform",
+            "engineering": "shared_eng",
+        }
+
+    def test_empty_map(self):
+        ext = _make_extension()
+        assert ext.shared_team_map == {}
+
+    def test_rejects_invalid_schema_name(self):
+        with pytest.raises(ValueError, match="shared_"):
+            _make_extension(shared_schema_map="engineering:not_shared")
+
+
+class TestSharedSchemaResolution:
+    @pytest.mark.asyncio
+    async def test_team_to_schema_resolution(self):
+        """Teams in shared_team_map resolve to shared schemas."""
+        ext = _make_extension(shared_schema_map="engineering:shared_eng,data:shared_data")
+        ext._http_client = AsyncMock()
+        ext._http_client.get.return_value = _teams_resp(["engineering"])
+        identity = MagicMock()
+        shared = await ext._shared_schemas_for_request("tok", identity, MagicMock())
+        assert shared == {"shared_eng"}
+
+    @pytest.mark.asyncio
+    async def test_multiple_teams_resolve(self):
+        ext = _make_extension(shared_schema_map="engineering:shared_eng,data:shared_data")
+        ext._http_client = AsyncMock()
+        ext._http_client.get.return_value = _teams_resp(["engineering", "data"])
+        identity = MagicMock()
+        shared = await ext._shared_schemas_for_request("tok", identity, MagicMock())
+        assert shared == {"shared_eng", "shared_data"}
+
+    @pytest.mark.asyncio
+    async def test_no_matching_team_returns_empty(self):
+        ext = _make_extension(shared_schema_map="engineering:shared_eng")
+        ext._http_client = AsyncMock()
+        ext._http_client.get.return_value = _teams_resp(["analysts"])
+        identity = MagicMock()
+        shared = await ext._shared_schemas_for_request("tok", identity, MagicMock())
+        assert shared == set()
+
+    @pytest.mark.asyncio
+    async def test_empty_map_returns_empty(self):
+        ext = _make_extension()
+        ext._http_client = AsyncMock()
+        identity = MagicMock()
+        shared = await ext._shared_schemas_for_request("tok", identity, MagicMock())
+        assert shared == set()
+        # No HTTP call needed when map is empty.
+        ext._http_client.get.assert_not_called()
+
+
+class TestAuthenticateWithSharedSchemas:
+    @pytest.mark.asyncio
+    async def test_readable_writable_populated(self):
+        """authenticate() sets readable_schemas and writable_schemas on TenantContext."""
+        ext = _make_extension(shared_schema_map="platform-admins:shared_platform")
+
+        def get(url, **kwargs):
+            if url.endswith("/user"):
+                return _user_resp(user_id=999, login="bob")
+            return _teams_resp(["platform-admins"])
+
+        ext._http_client = AsyncMock()
+        ext._http_client.get.side_effect = get
+        mock_ctx = MagicMock()
+        mock_ctx.run_migration = AsyncMock()
+        ext.set_context(mock_ctx)
+
+        result = await ext.authenticate(RequestContext(api_key="a" * 40))
+        assert result.readable_schemas == {"shared_platform"}
+        assert result.writable_schemas == {"shared_platform"}
+
+    @pytest.mark.asyncio
+    async def test_list_shared_schemas_after_authenticate(self):
+        """list_shared_schemas returns SharedSchema objects after authenticate."""
+        ext = _make_extension(shared_schema_map="platform-admins:shared_platform,engineering:shared_eng")
+
+        def get(url, **kwargs):
+            if url.endswith("/user"):
+                return _user_resp(user_id=999, login="bob")
+            return _teams_resp(["platform-admins", "engineering"])
+
+        ext._http_client = AsyncMock()
+        ext._http_client.get.side_effect = get
+        mock_ctx = MagicMock()
+        mock_ctx.run_migration = AsyncMock()
+        ext.set_context(mock_ctx)
+
+        await ext.authenticate(RequestContext(api_key="a" * 40))
+        schemas = await ext.list_shared_schemas(RequestContext(api_key="a" * 40))
+        schema_names = {s.schema for s in schemas}
+        assert schema_names == {"shared_platform", "shared_eng"}
+        assert all(isinstance(s, SharedSchema) for s in schemas)
+        assert all(s.writable for s in schemas)
+
+    @pytest.mark.asyncio
+    async def test_no_shared_schemas_without_map(self):
+        """Without shared_schema_map, readable/writable are empty."""
+        ext = _make_extension()
+
+        def get(url, **kwargs):
+            if url.endswith("/user"):
+                return _user_resp(user_id=1, login="alice")
+            return _teams_resp(["platform-admins"])
+
+        ext._http_client = AsyncMock()
+        ext._http_client.get.side_effect = get
+        mock_ctx = MagicMock()
+        mock_ctx.run_migration = AsyncMock()
+        ext.set_context(mock_ctx)
+
+        result = await ext.authenticate(RequestContext(api_key="a" * 40))
+        assert result.readable_schemas == set()
+        assert result.writable_schemas == set()

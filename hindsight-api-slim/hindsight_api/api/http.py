@@ -1197,6 +1197,38 @@ class BankListResponse(BaseModel):
     banks: list[BankListItem]
 
 
+# ---------------------------------------------------------------------------
+# Shared-schema models
+# ---------------------------------------------------------------------------
+
+
+class SharedSchemaInfo(BaseModel):
+    """A single shared schema entry returned by the list endpoint."""
+
+    schema_name: str
+    display_name: str | None = None
+    created_at: str | None = None
+    writable: bool
+
+
+class SharedSchemasResponse(BaseModel):
+    """Response model for GET /v1/shared/schemas."""
+
+    private_schema: str
+    shared: list[SharedSchemaInfo]
+    can_create: bool
+
+
+class CreateSharedSchemaRequest(BaseModel):
+    """Request body for POST /v1/shared/schemas."""
+
+    schema_name: str
+    display_name: str | None = None
+
+
+# ---------------------------------------------------------------------------
+
+
 class CreateBankRequest(BaseModel):
     """Request model for creating/updating a bank."""
 
@@ -7232,4 +7264,163 @@ def _register_routes(app: FastAPI):
             import traceback
 
             logger.error(f"Error getting LLM request stats: {traceback.format_exc()}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+    # -----------------------------------------------------------------------
+    # Shared-schema routes  (/v1/shared/schemas)
+    #
+    # Qualified bank ids (e.g. "shared_x/my_bank") arrive URL-encoded in path
+    # parameters as "shared_x%2Fmy_bank".  FastAPI / Starlette automatically
+    # percent-decodes path parameters before passing them to route handlers, so
+    # the handler receives the decoded string "shared_x/my_bank" containing a
+    # literal "/".  The engine's resolve_bank_target() splits on "/" to extract
+    # the schema and bare bank id, so no special handling is needed in the route
+    # decorators or handler bodies — the decoded bank_id flows straight through.
+    # -----------------------------------------------------------------------
+
+    @app.get(
+        "/v1/shared/schemas",
+        response_model=SharedSchemasResponse,
+        summary="List shared schemas visible to the caller",
+        description=(
+            "Returns the caller's private schema name, the shared schemas they may access "
+            "(with read/write flag), and whether they have permission to create new shared schemas. "
+            "Shared schemas are common memory-bank namespaces (e.g. per-codebase) that multiple "
+            "users read from and write to alongside their own private schema."
+        ),
+        operation_id="list_shared_schemas",
+        tags=["Shared Schemas"],
+    )
+    async def api_list_shared_schemas(
+        request_context: RequestContext = Depends(get_request_context),
+    ):
+        """List shared schemas visible to the authenticated caller."""
+        try:
+            result = await app.state.memory.list_visible_shared_schemas(
+                request_context=request_context
+            )
+            return SharedSchemasResponse(
+                private_schema=result["private_schema"],
+                shared=[SharedSchemaInfo(**s) for s in result["shared"]],
+                can_create=result["can_create"],
+            )
+        except OperationValidationError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason)
+        except (AuthenticationError, HTTPException):
+            raise
+        except Exception as e:
+            import traceback
+
+            logger.error(f"Error in GET /v1/shared/schemas: {traceback.format_exc()}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.post(
+        "/v1/shared/schemas",
+        response_model=None,
+        summary="Create a shared schema",
+        description=(
+            "Provision and register a new shared memory-bank schema. "
+            "Admin-only: returns 403 if the caller does not have admin role. "
+            "The schema name must start with 'shared_' and contain only lowercase letters, "
+            "digits, and underscores (e.g. 'shared_my_codebase'). "
+            "Returns 400 if the name is invalid, 403 if not admin."
+        ),
+        operation_id="create_shared_schema",
+        tags=["Shared Schemas"],
+        status_code=201,
+    )
+    async def api_create_shared_schema(
+        body: CreateSharedSchemaRequest,
+        request_context: RequestContext = Depends(get_request_context),
+    ):
+        """Create (provision + register) a new shared schema. Admin only."""
+        from hindsight_api.engine.shared_schemas import SharedSchemaValidationError
+
+        try:
+            record = await app.state.memory.create_shared_schema(
+                schema_name=body.schema_name,
+                display_name=body.display_name,
+                request_context=request_context,
+            )
+            return record
+        except SharedSchemaValidationError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except OperationValidationError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason)
+        except (AuthenticationError, HTTPException):
+            raise
+        except Exception as e:
+            import traceback
+
+            logger.error(f"Error in POST /v1/shared/schemas: {traceback.format_exc()}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.delete(
+        "/v1/shared/schemas/{schema_name}",
+        summary="Deregister a shared schema",
+        description=(
+            "Remove a shared schema from the registry. "
+            "Admin-only: returns 403 if the caller does not have admin role. "
+            "Returns 404 if the schema is not registered. "
+            "NOTE: This deregisters the schema only — the underlying PostgreSQL schema "
+            "and all its data are preserved."
+        ),
+        operation_id="delete_shared_schema",
+        tags=["Shared Schemas"],
+    )
+    async def api_delete_shared_schema(
+        schema_name: str,
+        request_context: RequestContext = Depends(get_request_context),
+    ):
+        """Deregister a shared schema (does not drop data). Admin only."""
+        try:
+            result = await app.state.memory.delete_shared_schema(
+                schema_name=schema_name,
+                request_context=request_context,
+            )
+            return result
+        except OperationValidationError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason)
+        except (AuthenticationError, HTTPException):
+            raise
+        except Exception as e:
+            import traceback
+
+            logger.error(f"Error in DELETE /v1/shared/schemas/{schema_name}: {traceback.format_exc()}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.delete(
+        "/v1/shared/schemas/{schema_name}/data",
+        summary="Permanently delete a shared schema and all its data",
+        description=(
+            "DESTRUCTIVE and IRREVERSIBLE. Deregisters the shared schema AND drops "
+            "the underlying PostgreSQL schema with CASCADE, permanently deleting every "
+            "bank, memory and document stored in it. "
+            "Admin-only: returns 403 if the caller does not have admin role. "
+            "Returns 404 if the schema is not registered. "
+            "Prefer DELETE /v1/shared/schemas/{schema_name} (deregister-only) unless you "
+            "explicitly intend to erase the data."
+        ),
+        operation_id="drop_shared_schema",
+        tags=["Shared Schemas"],
+    )
+    async def api_drop_shared_schema(
+        schema_name: str,
+        request_context: RequestContext = Depends(get_request_context),
+    ):
+        """Destructively drop a shared schema and all its data. Admin only."""
+        try:
+            result = await app.state.memory.drop_shared_schema(
+                schema_name=schema_name,
+                request_context=request_context,
+            )
+            return result
+        except OperationValidationError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason)
+        except (AuthenticationError, HTTPException):
+            raise
+        except Exception as e:
+            import traceback
+
+            logger.error(f"Error in DELETE /v1/shared/schemas/{schema_name}/data: {traceback.format_exc()}")
             raise HTTPException(status_code=500, detail=str(e))

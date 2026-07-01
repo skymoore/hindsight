@@ -1712,7 +1712,51 @@
         "update": "Impossible de mettre à jour le webhook",
         "delete": "Impossible de supprimer le webhook",
         "deliveries": "Impossible de récupérer les livraisons du webhook"
+      },
+      "sharedSchemas": {
+        "fetch": "Failed to fetch shared schemas",
+        "create": "Failed to create shared schema",
+        "delete": "Failed to delete shared schema",
+        "validation": {
+          "schemaNameRequired": "schema_name is required"
+        },
+        "dropData": "Failed to delete shared schema data"
       }
     }
+  },
+  "sharedSchemas": {
+    "title": "Shared schemas",
+    "description": "Shared memory-bank schemas are visible to your whole team. Administration is enforced by the data plane.",
+    "manage": "Manage shared schemas",
+    "loading": "Loading shared schemas…",
+    "loadError": "Failed to load shared schemas",
+    "empty": "No shared schemas yet.",
+    "readOnly": "read-only",
+    "yourBanks": "Your banks",
+    "sharedBanks": "Shared banks",
+    "createTitle": "Create shared schema",
+    "create": "Create",
+    "creating": "Creating…",
+    "createSuccess": "Shared schema created",
+    "createError": "Failed to create shared schema",
+    "schemaNamePlaceholder": "schema_name (e.g. shared_team)",
+    "displayNamePlaceholder": "Display name (optional)",
+    "schemaNameHint": "Schema names must start with \"shared_\".",
+    "deregister": "Deregister",
+    "deregistering": "Deregistering…",
+    "deregisterHint": "Remove this schema from the registry. Does not delete stored data.",
+    "deregisterSuccess": "Shared schema deregistered",
+    "deregisterError": "Failed to deregister shared schema",
+    "deleteData": "Delete data",
+    "deleteDataHint": "Permanently delete this schema and all its memories.",
+    "deleteDataTitle": "Delete shared schema data",
+    "deleteDataDescription": "This will permanently delete all memories stored in \"{schema}\". This action cannot be undone.",
+    "deleteDataConfirm": "Delete all data",
+    "cancel": "Cancel",
+    "deleteDataWarning": "This permanently drops the schema and deletes ALL banks, memories and documents in it. This cannot be undone.",
+    "deleteDataConfirmPrompt": "Type the schema name \"{schema}\" to confirm.",
+    "deleteDataInProgress": "Deleting…",
+    "deleteDataSuccess": "Shared schema and all its data deleted",
+    "deleteDataError": "Failed to delete shared schema data"
   }
 }

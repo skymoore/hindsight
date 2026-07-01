@@ -5828,6 +5828,226 @@
           }
         }
       }
+    },
+    "/v1/shared/schemas": {
+      "get": {
+        "tags": [
+          "Shared Schemas"
+        ],
+        "summary": "List shared schemas visible to the caller",
+        "description": "Returns the caller's private schema name, the shared schemas they may access (with read/write flag), and whether they have permission to create new shared schemas. Shared schemas are common memory-bank namespaces (e.g. per-codebase) that multiple users read from and write to alongside their own private schema.",
+        "operationId": "list_shared_schemas",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SharedSchemasResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "Shared Schemas"
+        ],
+        "summary": "Create a shared schema",
+        "description": "Provision and register a new shared memory-bank schema. Admin-only: returns 403 if the caller does not have admin role. The schema name must start with 'shared_' and contain only lowercase letters, digits, and underscores (e.g. 'shared_my_codebase'). Returns 400 if the name is invalid, 403 if not admin.",
+        "operationId": "create_shared_schema",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateSharedSchemaRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/shared/schemas/{schema_name}": {
+      "delete": {
+        "tags": [
+          "Shared Schemas"
+        ],
+        "summary": "Deregister a shared schema",
+        "description": "Remove a shared schema from the registry. Admin-only: returns 403 if the caller does not have admin role. Returns 404 if the schema is not registered. NOTE: This deregisters the schema only \u2014 the underlying PostgreSQL schema and all its data are preserved.",
+        "operationId": "delete_shared_schema",
+        "parameters": [
+          {
+            "name": "schema_name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Schema Name"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/shared/schemas/{schema_name}/data": {
+      "delete": {
+        "tags": [
+          "Shared Schemas"
+        ],
+        "summary": "Permanently delete a shared schema and all its data",
+        "description": "DESTRUCTIVE and IRREVERSIBLE. Deregisters the shared schema AND drops the underlying PostgreSQL schema with CASCADE, permanently deleting every bank, memory and document stored in it. Admin-only: returns 403 if the caller does not have admin role. Returns 404 if the schema is not registered. Prefer DELETE /v1/shared/schemas/{schema_name} (deregister-only) unless you explicitly intend to erase the data.",
+        "operationId": "drop_shared_schema",
+        "parameters": [
+          {
+            "name": "schema_name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Schema Name"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
@@ -7825,6 +8045,31 @@
         ],
         "title": "CreateMentalModelResponse",
         "description": "Response model for mental model creation."
+      },
+      "CreateSharedSchemaRequest": {
+        "properties": {
+          "schema_name": {
+            "type": "string",
+            "title": "Schema Name"
+          },
+          "display_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Display Name"
+          }
+        },
+        "type": "object",
+        "required": [
+          "schema_name"
+        ],
+        "title": "CreateSharedSchemaRequest",
+        "description": "Request body for POST /v1/shared/schemas."
       },
       "CreateWebhookRequest": {
         "properties": {
@@ -12170,6 +12415,74 @@
           "operation_id": "550e8400-e29b-41d4-a716-446655440000",
           "success": true
         }
+      },
+      "SharedSchemaInfo": {
+        "properties": {
+          "schema_name": {
+            "type": "string",
+            "title": "Schema Name"
+          },
+          "display_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Display Name"
+          },
+          "created_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Created At"
+          },
+          "writable": {
+            "type": "boolean",
+            "title": "Writable"
+          }
+        },
+        "type": "object",
+        "required": [
+          "schema_name",
+          "writable"
+        ],
+        "title": "SharedSchemaInfo",
+        "description": "A single shared schema entry returned by the list endpoint."
+      },
+      "SharedSchemasResponse": {
+        "properties": {
+          "private_schema": {
+            "type": "string",
+            "title": "Private Schema"
+          },
+          "shared": {
+            "items": {
+              "$ref": "#/components/schemas/SharedSchemaInfo"
+            },
+            "type": "array",
+            "title": "Shared"
+          },
+          "can_create": {
+            "type": "boolean",
+            "title": "Can Create"
+          }
+        },
+        "type": "object",
+        "required": [
+          "private_schema",
+          "shared",
+          "can_create"
+        ],
+        "title": "SharedSchemasResponse",
+        "description": "Response model for GET /v1/shared/schemas."
       },
       "SourceFactsIncludeOptions": {
         "properties": {

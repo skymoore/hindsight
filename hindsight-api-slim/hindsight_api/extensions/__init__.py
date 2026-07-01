@@ -70,6 +70,7 @@ from hindsight_api.extensions.operation_validator import (
 )
 from hindsight_api.extensions.tenant import (
     AuthenticationError,
+    SharedSchema,
     Tenant,
     TenantContext,
     TenantExtension,
@@ -126,6 +127,7 @@ __all__ = [
     "GitHubRoleOperationValidator",
     "AuthenticationError",
     "RequestContext",
+    "SharedSchema",
     "Tenant",
     "TenantContext",
     "TenantExtension",

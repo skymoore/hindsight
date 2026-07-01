@@ -1,7 +1,7 @@
 """Tenant Extension for multi-tenancy and API key authentication."""
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from hindsight_api.extensions.base import Extension
@@ -25,9 +25,34 @@ class TenantContext:
     Contains the PostgreSQL schema name for tenant isolation.
     All database queries will use fully-qualified table names
     with this schema (e.g., schema_name.memory_units).
+
+    ``schema_name`` is the caller's *primary* (private) schema — the schema used
+    for unqualified bank IDs. ``readable_schemas`` / ``writable_schemas`` list
+    additional *shared* schemas the caller may access via qualified bank IDs
+    ("schema/bank_id"). They default to empty, so single-tenant / per-user
+    extensions that only set ``schema_name`` are fully backward compatible.
+
+    Invariants:
+        - ``schema_name`` is always implicitly readable and writable.
+        - ``writable_schemas`` should be a subset of ``readable_schemas``.
     """
 
     schema_name: str
+    readable_schemas: set[str] = field(default_factory=set)
+    writable_schemas: set[str] = field(default_factory=set)
+
+
+@dataclass
+class SharedSchema:
+    """A shared schema the authenticated caller may access.
+
+    Returned by :meth:`TenantExtension.list_shared_schemas`. ``writable`` reflects
+    the read-many/write-many model: members of a shared schema get read+write.
+    """
+
+    schema: str
+    display_name: str | None = None
+    writable: bool = True
 
 
 @dataclass
@@ -142,6 +167,27 @@ class TenantExtension(Extension, ABC):
             Returned fields must be a subset of HindsightConfig.get_configurable_fields().
         """
         return None
+
+    async def list_shared_schemas(self, context: RequestContext) -> list["SharedSchema"]:
+        """
+        List shared schemas the authenticated caller may access.
+
+        Shared schemas are common memory banks (e.g. per-codebase) that multiple
+        users read from and write to, in addition to their own private schema.
+        Membership is resolved by the extension from its identity provider (e.g.
+        GitHub teams / OIDC groups) mapped to registered shared schema names.
+
+        The default implementation returns an empty list (no shared schemas).
+        Override in extensions that support shared banks.
+
+        Args:
+            context: The request context (already authenticated).
+
+        Returns:
+            List of SharedSchema the caller may access. Should only include
+            schemas that also exist in the ``public.shared_schemas`` registry.
+        """
+        return []
 
     async def authenticate_mcp(self, context: RequestContext) -> TenantContext:
         """
