@@ -432,6 +432,13 @@ class TestHttpExtensionUnit:
         router = ext.get_root_router(MagicMock())
         assert isinstance(router, APIRouter)
         assert len(router.routes) >= 3
+        paths = {getattr(r, "path", None) for r in router.routes}
+        # The bulk list route must use the hyphenated sibling path; the
+        # ``banks/visibility`` form collides with the core
+        # ``/v1/default/banks/{bank_id}`` route and yields 405 on GET.
+        assert "/v1/default/banks-visibility" in paths
+        assert "/v1/default/banks/visibility" not in paths
+        assert "/v1/default/banks/{bank_id}/visibility" in paths
 
     def test_visibility_update_accepts_private(self):
         assert VisibilityUpdate(visibility="private").visibility == "private"

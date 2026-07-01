@@ -13,7 +13,9 @@ jobs:
 2. **Exposes visibility routes at the application root** (not under ``/ext``), so
    they live alongside the built-in bank routes as
    ``/v1/default/banks/{bank_id}/visibility`` and
-   ``/v1/default/banks/visibility``. This is why the routes are returned from
+   ``/v1/default/banks-visibility`` (the bulk list uses a hyphenated sibling
+   path to avoid colliding with the core ``/v1/default/banks/{bank_id}``
+   route). This is why the routes are returned from
    :meth:`get_root_router`; :meth:`get_router` returns an empty router because
    the :class:`HttpExtension` base requires it.
 
@@ -309,7 +311,12 @@ class GitHubOrgBanksHttpExtension(HttpExtension):
                 "can_share": is_owner or caller_is_admin,
             }
 
-        @router.get("/v1/default/banks/visibility")
+        # NOTE: the bulk path is ``/v1/default/banks-visibility`` (hyphen), NOT
+        # ``/v1/default/banks/visibility``. The latter collides with the core
+        # ``/v1/default/banks/{bank_id}`` route (PUT/PATCH/DELETE, no GET), so a
+        # GET there is matched by the core route and returns 405. Using a
+        # sibling path avoids the path-parameter collision entirely.
+        @router.get("/v1/default/banks-visibility")
         async def list_visibility(
             authorization: str | None = Header(default=None),
         ) -> dict[str, object]:

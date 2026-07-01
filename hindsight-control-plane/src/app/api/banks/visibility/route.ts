@@ -5,7 +5,7 @@ import { DATAPLANE_URL, getDataplaneHeaders } from "@/lib/hindsight-client";
 export async function GET(request: NextRequest) {
   try {
     // Direct fetch since the SDK doesn't have this operation yet.
-    const url = `${DATAPLANE_URL}/v1/default/banks/visibility`;
+    const url = `${DATAPLANE_URL}/v1/default/banks-visibility`;
     const response = await fetch(url, {
       headers: getDataplaneHeaders(request),
     });

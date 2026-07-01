@@ -344,7 +344,12 @@ Claim/create ownership (first call) or change visibility. Idempotent.
 // 403  { "error": "Only the bank owner or an org admin may change visibility." }
 ```
 
-### `GET /v1/default/banks/visibility`  *(optional bulk prime)*
+### `GET /v1/default/banks-visibility`  *(optional bulk prime)*
+
+> Note: this bulk route uses the hyphenated path `banks-visibility` (a sibling
+> of `/v1/default/banks`) rather than `banks/visibility`. The latter would be
+> matched by the core `/v1/default/banks/{bank_id}` route (which registers
+> PUT/PATCH/DELETE but no GET) and return `405 Method Not Allowed`.
 
 Returns visibility for all banks the caller can see; used by the CP to prime the
 list badges and the enforcement cache in one call.
@@ -443,7 +448,7 @@ dataplane endpoints:
 |--------------|--------|----------------------|---------|
 | `/api/banks/[bankId]/visibility` | `GET`  | `GET /v1/default/banks/{bankId}/visibility` | bank page: show private/shared + `can_share` |
 | `/api/banks/[bankId]/visibility` | `PUT`  | `PUT /v1/default/banks/{bankId}/visibility` | "New bank" (claim, `private`), "Share"/"Make private" toggle |
-| `/api/banks/visibility`          | `GET`  | `GET /v1/default/banks/visibility` (bulk) | bank list: badges + prime enforcement cache |
+| `/api/banks/visibility`          | `GET`  | `GET /v1/default/banks-visibility` (bulk) | bank list: badges + prime enforcement cache |
 
 **UI**
 
