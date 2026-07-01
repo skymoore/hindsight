@@ -25,6 +25,7 @@ License: MIT
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import time
@@ -131,6 +132,20 @@ _ORG_OWNERSHIP: OrgSnapshot | None = None
 # stores it here so the other can refresh the snapshot without a ``memory`` ref.
 _POOL: "asyncpg.Pool | None" = None
 
+# Last-resort pool the validator owns itself, created from the configured
+# database URL. This exists because the operation-validator extension's
+# ExtensionContext is never wired on the **worker** process (worker/main.py loads
+# it without a context) and the worker has no HTTP extension to call
+# ``set_pool``. Without this, every worker write to an owned/private bank fails
+# closed (no snapshot -> deny), so async retain/consolidation stall. Created once
+# under ``_OWN_POOL_LOCK`` and reused. Kept separate from ``_POOL`` so a later
+# ``set_pool`` from the engine still takes precedence.
+_OWN_POOL: "asyncpg.Pool | None" = None
+_OWN_POOL_LOCK: "asyncio.Lock | None" = None
+
+# Env var holding the primary database URL (mirrors hindsight_api.config).
+_ENV_DATABASE_URL = "HINDSIGHT_API_DATABASE_URL"
+
 
 def get_snapshot() -> OrgSnapshot | None:
     """Return the current org ownership snapshot, or ``None`` if never primed."""
@@ -178,29 +193,70 @@ async def ensure_pool_via_context(context: "ExtensionContext | None") -> "asyncp
     3. On success the pool is registered via :func:`set_pool` so subsequent calls
        are fast and the HTTP extension and validator share one handle.
 
+    4. As a **last resort** (worker process: no registered pool AND no context),
+       create a small pool owned by this module from
+       ``HINDSIGHT_API_DATABASE_URL`` via :func:`_ensure_own_pool`. This is what
+       keeps async retain/consolidation working on the worker, whose validator
+       context is never wired.
+
     All failures are swallowed and return ``None`` so callers can fail closed.
     ``context`` may be ``None`` (or ``self.context`` may raise ``RuntimeError`` if
-    it was never set); both cases resolve to ``None``.
+    it was never set); both cases fall through to the self-owned pool.
     """
     pool = get_pool()
     if pool is not None:
         return pool
-    if context is None:
+    if context is not None:
+        try:
+            engine = context.get_memory_engine()
+            get_pool_method = getattr(engine, "_get_pool", None)
+            if get_pool_method is not None:
+                pool = await get_pool_method()
+                if pool is not None:
+                    set_pool(pool)
+                    return pool
+        except Exception:  # noqa: BLE001 — fall through to the self-owned pool.
+            logger.warning("github_org: failed to obtain pool via extension context", exc_info=True)
+
+    # Last resort: a pool this module owns, built from the configured DB URL.
+    return await _ensure_own_pool()
+
+
+async def _ensure_own_pool() -> "asyncpg.Pool | None":
+    """Create (once) and return a small asyncpg pool from ``HINDSIGHT_API_DATABASE_URL``.
+
+    Used only when no engine pool is reachable (the worker path). The pool is
+    created under a lock so concurrent first callers share one, and cached in
+    :data:`_OWN_POOL`. Failures return ``None`` (fail closed).
+    """
+    global _OWN_POOL, _OWN_POOL_LOCK
+    if _OWN_POOL is not None:
+        return _OWN_POOL
+
+    raw_url = (os.getenv(_ENV_DATABASE_URL) or "").strip()
+    if not raw_url:
         return None
-    try:
-        engine = context.get_memory_engine()
-        get_pool_method = getattr(engine, "_get_pool", None)
-        if get_pool_method is None:
-            # Engine does not expose a pool (e.g. a non-default backend); fall back
-            # to whatever get_pool() has (still None here).
-            return get_pool()
-        pool = await get_pool_method()
-        if pool is not None:
-            set_pool(pool)
-        return pool
-    except Exception:  # noqa: BLE001 — fail closed; caller denies access on None.
-        logger.warning("github_org: failed to obtain pool via extension context", exc_info=True)
-        return None
+
+    if _OWN_POOL_LOCK is None:
+        _OWN_POOL_LOCK = asyncio.Lock()
+
+    async with _OWN_POOL_LOCK:
+        if _OWN_POOL is not None:  # re-check under the lock
+            return _OWN_POOL
+        try:
+            import asyncpg
+
+            from hindsight_api.db_url import to_libpq_url
+
+            dsn = to_libpq_url(raw_url)
+            # Small pool: the validator only runs short SELECT/INSERT ownership
+            # queries. Keep it modest so it never competes with the engine pool.
+            _OWN_POOL = await asyncpg.create_pool(dsn=dsn, min_size=1, max_size=2)
+            logger.info("github_org: created self-owned ownership pool (no engine pool/context available)")
+            return _OWN_POOL
+        except Exception:  # noqa: BLE001 — fail closed; caller denies on None.
+            logger.warning("github_org: failed to create self-owned ownership pool", exc_info=True)
+            return None
 
 
 def parse_user_id_from_tenant_id(tenant_id: str | None) -> str | None:

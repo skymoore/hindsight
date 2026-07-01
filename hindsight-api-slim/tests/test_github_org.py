@@ -57,9 +57,13 @@ def _reset_shared_state():
     """Reset the module-level snapshot/pool globals before and after each test."""
     shared._ORG_OWNERSHIP = None
     shared._POOL = None
+    shared._OWN_POOL = None
+    shared._OWN_POOL_LOCK = None
     yield
     shared._ORG_OWNERSHIP = None
     shared._POOL = None
+    shared._OWN_POOL = None
+    shared._OWN_POOL_LOCK = None
 
 
 def _fresh_snapshot(rows: dict[str, tuple[str, str]]) -> OrgSnapshot:
@@ -135,8 +139,9 @@ class TestEnsurePoolViaContext:
     """Cover the shared ``ensure_pool_via_context`` helper (DB-free)."""
 
     @pytest.mark.asyncio
-    async def test_no_context_no_pool_returns_none(self):
-        # No registered pool and no context -> nothing to resolve.
+    async def test_no_context_no_pool_returns_none(self, monkeypatch):
+        # No registered pool, no context, and no DB URL -> nothing to resolve.
+        monkeypatch.delenv("HINDSIGHT_API_DATABASE_URL", raising=False)
         assert get_pool() is None
         assert await ensure_pool_via_context(None) is None
 
@@ -162,13 +167,46 @@ class TestEnsurePoolViaContext:
         assert get_pool() is fake_pool
 
     @pytest.mark.asyncio
-    async def test_engine_lookup_failure_returns_none(self):
-        # If the context cannot yield an engine, fail closed (None).
+    async def test_engine_lookup_failure_returns_none(self, monkeypatch):
+        # If the context cannot yield an engine AND there is no DB URL for the
+        # self-owned fallback, fail closed (None).
+        monkeypatch.delenv("HINDSIGHT_API_DATABASE_URL", raising=False)
         context = MagicMock()
         context.get_memory_engine.side_effect = RuntimeError("no engine yet")
 
         assert await ensure_pool_via_context(context) is None
         assert get_pool() is None
+
+    @pytest.mark.asyncio
+    async def test_self_owned_pool_fallback_created_without_context(self, monkeypatch):
+        # Worker path: no registered pool, no context, but a DB URL is set ->
+        # the module creates and caches its own pool via asyncpg.create_pool.
+        monkeypatch.setenv("HINDSIGHT_API_DATABASE_URL", "postgresql://u:p@h:5432/db")
+        fake_pool = MagicMock()
+        create_pool = AsyncMock(return_value=fake_pool)
+        import asyncpg
+
+        monkeypatch.setattr(asyncpg, "create_pool", create_pool)
+
+        resolved = await ensure_pool_via_context(None)
+        assert resolved is fake_pool
+        # Cached: a second call reuses it without creating another pool.
+        assert await ensure_pool_via_context(None) is fake_pool
+        assert create_pool.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_registered_pool_preferred_over_self_owned(self, monkeypatch):
+        # A registered engine pool always wins over the self-owned fallback.
+        monkeypatch.setenv("HINDSIGHT_API_DATABASE_URL", "postgresql://u:p@h:5432/db")
+        engine_pool = MagicMock()
+        set_pool(engine_pool)
+        import asyncpg
+
+        create_pool = AsyncMock()
+        monkeypatch.setattr(asyncpg, "create_pool", create_pool)
+
+        assert await ensure_pool_via_context(None) is engine_pool
+        create_pool.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
@@ -352,7 +390,16 @@ class TestValidatorPerBankAccess:
         member = _ctx("1024", ROLE_MEMBER)
         assert (await validator.validate_bank_write(_write_ctx("mine", member))).allowed
         # "team" is shared but owned by 999 -> member is neither owner nor admin.
+        # Sharing grants read to the org, not write; the claim path is NOT taken
+        # because the bank is already owned.
         assert not (await validator.validate_bank_write(_write_ctx("team", member))).allowed
+
+    @pytest.mark.asyncio
+    async def test_member_cannot_write_others_private(self, validator):
+        set_snapshot(_fresh_snapshot(_ROWS))
+        member = _ctx("1024", ROLE_MEMBER)
+        # "secret" is private, owned by 999 -> denied, no claim attempted.
+        assert not (await validator.validate_bank_write(_write_ctx("secret", member))).allowed
 
     @pytest.mark.asyncio
     async def test_admin_writes_shared(self, validator):
@@ -390,6 +437,102 @@ class TestValidatorUnownedBanks:
         member = _ctx("1024", ROLE_MEMBER)
         assert not (await validator.validate_bank_read(_read_ctx("legacy", member))).allowed
         assert (await validator.validate_bank_read(_read_ctx("legacy", _ctx("1", ROLE_ADMIN)))).allowed
+
+
+class TestFirstWriterOwnership:
+    """First write to an unowned bank claims it private for the caller.
+
+    The DB-bound claim (:meth:`_claim_bank_if_unowned`) is stubbed so these stay
+    DB-free; a separate integration path exercises the real INSERT.
+    """
+
+    @pytest.mark.asyncio
+    async def test_member_write_unowned_bank_claims_and_allows(self, validator, monkeypatch):
+        set_snapshot(_fresh_snapshot(_ROWS))
+        claimed: list[tuple[str, str]] = []
+
+        async def _fake_claim(bank_id, caller_user_id):
+            claimed.append((bank_id, caller_user_id))
+            return True
+
+        monkeypatch.setattr(validator, "_claim_bank_if_unowned", _fake_claim)
+        member = _ctx("1024", ROLE_MEMBER)
+        # "fresh" is not in the snapshot -> unowned -> claim -> allowed.
+        assert (await validator.validate_bank_write(_write_ctx("fresh", member))).allowed
+        assert claimed == [("fresh", "1024")]
+
+    @pytest.mark.asyncio
+    async def test_retain_unowned_bank_claims_private(self, validator, monkeypatch):
+        set_snapshot(_fresh_snapshot(_ROWS))
+        calls: list[tuple[str, str]] = []
+
+        async def _fake_claim(bank_id, caller_user_id):
+            calls.append((bank_id, caller_user_id))
+            return True
+
+        monkeypatch.setattr(validator, "_claim_bank_if_unowned", _fake_claim)
+        member = _ctx("1024", ROLE_MEMBER)
+        assert (await validator.validate_retain(_retain_ctx("fresh", member))).allowed
+        assert calls == [("fresh", "1024")]
+
+    @pytest.mark.asyncio
+    async def test_race_loser_denied(self, validator, monkeypatch):
+        # A concurrent caller won the claim: our claim returns False -> deny.
+        set_snapshot(_fresh_snapshot(_ROWS))
+
+        async def _fake_claim(bank_id, caller_user_id):
+            return False
+
+        monkeypatch.setattr(validator, "_claim_bank_if_unowned", _fake_claim)
+        member = _ctx("1024", ROLE_MEMBER)
+        assert not (await validator.validate_bank_write(_write_ctx("fresh", member))).allowed
+
+    @pytest.mark.asyncio
+    async def test_no_identity_no_claim(self, validator, monkeypatch):
+        set_snapshot(_fresh_snapshot(_ROWS))
+        called = False
+
+        async def _fake_claim(bank_id, caller_user_id):
+            nonlocal called
+            called = True
+            return True
+
+        monkeypatch.setattr(validator, "_claim_bank_if_unowned", _fake_claim)
+        # tenant_id without a parseable user id -> no claim, denied.
+        ctx = RequestContext(api_key="x", tenant_id="not-a-gh-tenant")
+        assert not (await validator.validate_bank_write(_write_ctx("fresh", ctx))).allowed
+        assert called is False
+
+    @pytest.mark.asyncio
+    async def test_admin_writes_unowned_without_claim(self, validator, monkeypatch):
+        # Admins may write anything and short-circuit before the claim path.
+        set_snapshot(_fresh_snapshot(_ROWS))
+        called = False
+
+        async def _fake_claim(bank_id, caller_user_id):
+            nonlocal called
+            called = True
+            return True
+
+        monkeypatch.setattr(validator, "_claim_bank_if_unowned", _fake_claim)
+        assert (await validator.validate_bank_write(_write_ctx("fresh", _ctx("1", ROLE_ADMIN)))).allowed
+        assert called is False
+
+    @pytest.mark.asyncio
+    async def test_viewer_unowned_write_rejected_without_claim(self, validator, monkeypatch):
+        set_snapshot(_fresh_snapshot(_ROWS))
+        called = False
+
+        async def _fake_claim(bank_id, caller_user_id):
+            nonlocal called
+            called = True
+            return True
+
+        monkeypatch.setattr(validator, "_claim_bank_if_unowned", _fake_claim)
+        # Read-only role is rejected by the role gate before any claim.
+        result = await validator.validate_retain(_retain_ctx("fresh", _ctx("1024", ROLE_VIEWER)))
+        assert not result.allowed
+        assert called is False
 
 
 # ---------------------------------------------------------------------------

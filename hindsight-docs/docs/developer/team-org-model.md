@@ -214,29 +214,46 @@ The core `banks` table is **not** modified.
 
 There is **no `create_bank` endpoint** in Hindsight — banks are created *lazily*
 on first write (first `retain`, `update_bank`, etc.). So "create a bank" from the
-user's perspective is "first write to a new `bank_id`". Ownership is therefore
-**not** recorded by a (non-existent) post-create hook. Instead:
+user's perspective is "first write to a new `bank_id`". Ownership is recorded by
+the **first-writer-wins** rule enforced in the operation validator:
 
-- The HTTP extension exposes an explicit **claim/create** step used by the
-  control plane's "New bank" action:
-  `PUT /v1/default/banks/{bank_id}/visibility` with `{"visibility":"private"}`.
-  This inserts `(bank_id, caller_user_id, 'private')` if absent — establishing
-  ownership up front. New banks are **private by default**.
-- **Writes that skip the CP** (e.g. a direct API `retain` to a new bank): the bank
-  is created lazily by the engine with **no** `bank_ownership` row, so it is
-  governed by the `..._UNOWNED_BANKS` policy (shared by default, or `admin_only`)
-  until someone explicitly claims it. There is **no** automatic ownership
-  back-fill from arbitrary requests — the true creator cannot be determined after
-  the fact, so attributing ownership to whoever's request happens to trigger a
-  refresh would mis-attribute it. Ownership becomes real only when a caller
-  invokes `PUT .../visibility` (the CP "New bank" / share flow).
-- **Share / unshare**: `PUT .../visibility` with `{"visibility":"shared"}` /
-  `{"visibility":"private"}`. Allowed for the bank's **owner** or an **admin**.
+- **First write to an unowned `bank_id`** (any write path — `retain`, `reflect`,
+  `update_bank`, or the CP "New bank" action): the writing caller becomes the
+  **owner** and the bank is created **private**. The validator performs an
+  atomic claim before allowing the write:
+
+  ```sql
+  INSERT INTO bank_ownership (bank_id, owner_user_id, visibility)
+  VALUES ($1, $2, 'private')
+  ON CONFLICT (bank_id) DO NOTHING
+  ```
+
+  This is race-safe on the `bank_ownership` primary key: if two callers write a
+  brand-new `bank_id` concurrently, exactly one wins ownership; the loser is
+  then denied write (it is neither owner nor admin of a now-private bank) and
+  gets a `403`. This closes the silent-collision hole where two users naming
+  their bank the same thing (e.g. an agent defaulting to `bank_id="opencode"`)
+  would otherwise share one bank and read/write each other's memories.
+
+  A known caller identity is required (parsed from `tenant_id`); a request
+  without one is denied rather than writing an empty owner.
+
+- **Explicit claim / share via the CP**: `PUT /v1/default/banks/{bank_id}/visibility`.
+  `{"visibility":"private"}` claims/creates ownership up front (same insert as
+  above); `{"visibility":"shared"}` shares an owned bank with the whole org.
+  Allowed for the bank's **owner** or an **admin**.
+- **Sharing grants read, not write**: a shared bank is readable by the whole org,
+  but only its owner (or an admin) may write it.
+- **`..._UNOWNED_BANKS` no longer gates writes.** Because the first writer always
+  claims the bank private, the policy only affects the defensive **read/list**
+  fallback for a bank row that somehow exists with *no* ownership entry (e.g. a
+  bank created out-of-band, or before this profile was enabled). `shared` = show
+  it to the org; `admin_only` = hide it from non-admins.
 - **Delete**: there is no delete hook on the HTTP side, and the priming pass only
   **reads** the `bank_ownership` table — it never mutates it. A deleted bank's
   stale ownership row is harmless (it references a `bank_id` the engine no longer
-  serves) and is simply left in place until the id is reclaimed via
-  `PUT .../visibility`.
+  serves) and is simply left in place until the id is reclaimed by the next
+  first writer.
 
 ### Enforcement wiring (how the validator reads ownership without a DB handle)
 
@@ -284,19 +301,41 @@ too. Two safeguards keep them correct without the CP:
    uses, so any process that has served one visibility request has a warm
    snapshot.
 2. For the worker (which serves no HTTP requests), the validator refreshes
-   `_ORG_OWNERSHIP` itself. The HTTP extension exposes a module-level
-   `set_pool(pool)` that both extensions import; the first component to obtain the
-   pool stores it, and the validator's refresh path uses it. If no pool is
-   available yet, the validator fails closed (rejects) rather than allowing.
+   `_ORG_OWNERSHIP` itself. It obtains an `asyncpg` pool through
+   `ensure_pool_via_context`, which resolves in this order:
+   1. a pool already registered via `set_pool` (e.g. by the HTTP extension in an
+      API process);
+   2. the memory engine exposed by the validator's `ExtensionContext`, if one was
+      wired;
+   3. a **self-owned pool** the shared module creates once from
+      `HINDSIGHT_API_DATABASE_URL`.
+
+   Step 3 is essential on the worker: the operation-validator extension's
+   `ExtensionContext` is **not** wired there (the worker loads it without a
+   context) and there is no HTTP extension to call `set_pool`, so without a
+   self-owned pool the validator would fail closed and **every async
+   retain/consolidation on an owned or private bank would stall** (the job is
+   denied `write access` and retried forever). The self-owned pool is small
+   (`max_size=2`), created under a lock, and always yields to a real engine pool
+   registered later. `fq_table` still resolves the correct schema because the
+   worker sets the `_current_schema` contextvar from the task's `_schema` before
+   the validator runs. If no pool can be obtained by any route, the validator
+   fails closed (rejects) rather than allowing.
+
+   > Async worker tasks preserve the **original** caller's identity: the queued
+   > operation stashes `_tenant_id` (`gh_<user_id>:<role>`), and the worker
+   > restores it into the `RequestContext` before validation. So the ownership
+   > check runs as the user who submitted the retain — the owner of the bank —
+   > and passes.
 
 Access decisions (all in the authorization extension):
 
 | Hook                        | Rule |
 |-----------------------------|------|
 | `validate_bank_read`        | allow if bank in caller's `shared`, in caller's `owned`, or caller `is_admin`; else `reject(404)` (hide existence). |
-| `validate_bank_write`       | allow if (owner or admin) **and** role permits writes (member/admin); else reject. |
+| `validate_bank_write`       | role must permit writes (member/admin). Then: admin → allow; owner → allow; owned by someone else → reject; **unowned → atomically claim private for the caller (first-writer-wins) and allow** (race loser rejected). |
 | `filter_bank_list`          | keep only banks in `owned ∪ shared` (admins keep all). |
-| `validate_retain`/`reflect` | role gate (viewer rejected) **and** the read/write ownership check for the target bank. |
+| `validate_retain`/`reflect` | role gate (viewer rejected) **and** the write check above (which auto-claims a new bank private for the caller). |
 | `validate_recall`           | allow if the caller may read the target bank (viewer allowed). |
 
 Because visibility is at the **bank** level, `recall` never needs per-memory
@@ -304,15 +343,17 @@ filtering: if the caller may read the bank, they may recall all of it; otherwise
 the whole operation is rejected. This keeps the model out of row-level-ACL
 territory (an explicit non-goal).
 
-Banks with **no** `bank_ownership` row (created before this profile, or by another
-tenant extension) are treated per `..._UNOWNED_BANKS`:
-`shared` (default — visible to the org) or `admin_only`. Enabling the profile
-never orphans existing data.
+On a **write**, a bank with no `bank_ownership` row is claimed private for the
+writer (first-writer-wins), so it is never left unowned once written. The
+`..._UNOWNED_BANKS` policy therefore only affects **reads/lists** of a bank that
+somehow has a row in the engine but no ownership entry (created before this
+profile, or by another tenant extension): `shared` (default — visible to the
+org) or `admin_only`. Enabling the profile never orphans existing data.
 
 ## API contract (dataplane, HTTP extension routes)
 
 All routes are mounted at the app root by the HTTP extension and are tenant-scoped
-by the active org schema (same auth + `X-Hindsight-Org-Id` as every other route).
+by the active org schema (same auth as every other route).
 
 ### `GET /v1/default/banks/{bank_id}/visibility`
 

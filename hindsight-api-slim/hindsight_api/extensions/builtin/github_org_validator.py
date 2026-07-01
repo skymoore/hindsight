@@ -46,11 +46,13 @@ from typing import TYPE_CHECKING
 from hindsight_api.extensions.builtin.github_org_shared import (
     BANK_OWNERSHIP_TABLE,
     DEFAULT_OWNERSHIP_CACHE_TTL,
+    VISIBILITY_PRIVATE,
     CallerView,
     OrgSnapshot,
     caller_view_from_snapshot,
     ensure_pool_via_context,
     get_snapshot,
+    parse_user_id_from_tenant_id,
     set_snapshot,
     snapshot_is_fresh,
     validate_authz_profile,
@@ -106,6 +108,12 @@ class GitHubOrgAuthorizationExtension(OperationValidatorExtension):
         else:
             self._ttl = DEFAULT_OWNERSHIP_CACHE_TTL
             self._unowned_banks = _UNOWNED_SHARED
+
+        # Per-schema guard for the lazy ``bank_ownership`` CREATE TABLE, mirroring
+        # GitHubOrgBanksHttpExtension._ensured_schemas. The validator may be the
+        # first component to touch the table on worker/cold paths the HTTP
+        # extension never serves, so it must be able to create it too.
+        self._ensured_schemas: set[str] = set()
 
     # ------------------------------------------------------------------
     # Role gating helpers (mirror github_role_validator)
@@ -202,6 +210,89 @@ class GitHubOrgAuthorizationExtension(OperationValidatorExtension):
         return view, set(snapshot.rows.keys())
 
     # ------------------------------------------------------------------
+    # First-writer ownership claim
+    # ------------------------------------------------------------------
+
+    async def _ensure_table(self, conn) -> None:
+        """Create the per-schema ``bank_ownership`` table if it does not exist.
+
+        Idempotent and cached per schema per process, mirroring
+        :meth:`GitHubOrgBanksHttpExtension._ensure_table`. The validator can be
+        the first component to write ownership (e.g. a worker retain before any
+        ``/visibility`` route has run), so it must be able to create the table.
+        """
+        from hindsight_api.engine.memory_engine import get_current_schema
+        from hindsight_api.engine.schema import fq_table
+
+        schema = get_current_schema()
+        if schema in self._ensured_schemas:
+            return
+        await conn.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {fq_table(BANK_OWNERSHIP_TABLE)} (
+              bank_id text PRIMARY KEY,
+              owner_user_id text NOT NULL,
+              visibility text NOT NULL DEFAULT '{VISIBILITY_PRIVATE}',
+              created_at timestamptz NOT NULL DEFAULT now(),
+              updated_at timestamptz NOT NULL DEFAULT now()
+            )
+            """
+        )
+        self._ensured_schemas.add(schema)
+
+    async def _claim_bank_if_unowned(self, bank_id: str, caller_user_id: str) -> bool:
+        """Atomically claim ``bank_id`` as private, owned by ``caller_user_id``.
+
+        This is the first-writer-wins ownership rule: the first write-capable
+        caller to touch a bank with no ownership row becomes its owner and the
+        bank is created **private**. The claim is race-safe via
+        ``INSERT ... ON CONFLICT (bank_id) DO NOTHING`` on the ``bank_ownership``
+        primary key, so two callers racing to a brand-new bank produce exactly
+        one owner; the loser is subsequently denied by :meth:`_can_write_bank`.
+
+        Returns ``True`` when the caller now owns the bank (either this call
+        claimed it, or a concurrent claim by the *same* caller won). Returns
+        ``False`` on any failure (fail closed) or when a *different* caller won
+        the race.
+
+        The freshly-primed snapshot is refreshed so subsequent checks in the
+        same request observe the claim without waiting for the TTL.
+        """
+        from hindsight_api.engine.schema import fq_table
+
+        pool = await ensure_pool_via_context(self._get_context())
+        if pool is None:
+            return False
+        try:
+            table = fq_table(BANK_OWNERSHIP_TABLE)
+            async with pool.acquire() as conn:
+                await self._ensure_table(conn)
+                await conn.execute(
+                    f"""
+                    INSERT INTO {table} (bank_id, owner_user_id, visibility)
+                    VALUES ($1, $2, $3)
+                    ON CONFLICT (bank_id) DO NOTHING
+                    """,
+                    bank_id,
+                    caller_user_id,
+                    VISIBILITY_PRIVATE,
+                )
+                # Read back the authoritative owner (handles the race: the row
+                # may have been claimed by a concurrent caller).
+                owner = await conn.fetchval(
+                    f"SELECT owner_user_id FROM {table} WHERE bank_id = $1",
+                    bank_id,
+                )
+        except Exception:  # noqa: BLE001 — fail closed; caller denies on False.
+            logger.warning("github_org: failed to claim ownership for bank %r", bank_id, exc_info=True)
+            return False
+
+        # Refresh the snapshot so the just-written row is visible to the rest of
+        # this request (and to the HTTP extension / other hooks).
+        await self._refresh_snapshot()
+        return owner == caller_user_id
+
+    # ------------------------------------------------------------------
     # Per-bank access checks
     # ------------------------------------------------------------------
 
@@ -223,10 +314,23 @@ class GitHubOrgAuthorizationExtension(OperationValidatorExtension):
     async def _can_write_bank(self, bank_id: str, request_context: RequestContext) -> bool:
         """Return True when the caller may write ``bank_id`` (fail closed).
 
-        Requires both a write-capable role and (owner OR admin) on the bank.
-        Unknown banks are permitted for write-role callers only when the
-        unowned-bank policy is ``shared`` (claiming happens in the HTTP
-        extension); otherwise only admins may write them.
+        Requires a write-capable role. The per-bank rule is:
+
+        - **Admin**: may write any bank.
+        - **Owner**: may write banks they own.
+        - **Unowned bank (no ownership row)**: the caller becomes the owner via
+          first-writer-wins and the bank is created **private**
+          (:meth:`_claim_bank_if_unowned`). This is the privacy-by-default rule:
+          a bank belongs to whoever first writes it and is not shared until the
+          owner explicitly shares it via the ``PUT .../visibility`` route.
+        - **Shared bank owned by someone else**: denied. Sharing grants *read*
+          to the org, not write; only the owner or an admin may write.
+        - **Private bank owned by someone else**: denied.
+
+        The ``github_org_unowned_banks`` policy no longer gates writes: the
+        first writer always claims the bank private. (It only affects the
+        defensive read/list fallback for a bank row that somehow exists with no
+        ownership entry.)
         """
         resolved = await self._get_view_and_known(request_context)
         if resolved is None:
@@ -238,9 +342,17 @@ class GitHubOrgAuthorizationExtension(OperationValidatorExtension):
             return True
         if bank_id in view.owned:
             return True
-        if bank_id not in known:
-            return self._unowned_banks == _UNOWNED_SHARED
-        return False
+        if bank_id in known:
+            # Owned by someone else (shared or private) — never writable by a
+            # non-owner, non-admin caller.
+            return False
+
+        # Unowned: first-writer-wins. Claim it private for this caller. Requires
+        # a known caller identity so we never write an empty owner.
+        caller_user_id = parse_user_id_from_tenant_id(request_context.tenant_id)
+        if not caller_user_id:
+            return False
+        return await self._claim_bank_if_unowned(bank_id, caller_user_id)
 
     # ------------------------------------------------------------------
     # Core operation hooks (abstract - required)
