@@ -55,7 +55,9 @@ import httpx
 
 from hindsight_api.extensions.builtin.github_org_shared import (
     encode_org_tenant_id,
+    get_snapshot,
     parse_role_from_org_tenant_id,
+    parse_user_id_from_tenant_id,
     validate_authz_profile,
 )
 from hindsight_api.extensions.builtin.github_tenant import (
@@ -237,13 +239,41 @@ class GitHubOrgTenantExtension(GitHubTenantExtension):
         ``ConfigResolver.override``). We re-derive the role with the login-aware
         :func:`parse_role_from_org_tenant_id`.
 
-        - admin  -> None (all configurable fields)
-        - member -> a curated subset (inherited from github_tenant)
-        - viewer / unknown -> empty set (read-only, fail closed)
+        Rules (mirroring the ownership model so anyone can fully configure a bank
+        they own — e.g. importing a template into a bank they just created):
+
+        - **admin** -> ``None`` (all configurable fields, any bank).
+        - **member, bank they own** -> ``None`` (full config on their own bank).
+        - **member, unowned bank** -> ``None``: first-writer-wins means the
+          member is about to own this bank, so allow full config. (The companion
+          validator performs the actual ownership claim on write.)
+        - **member, bank owned by someone else** -> the curated subset
+          (:data:`_MEMBER_ALLOWED_FIELDS`); a non-owner cannot reconfigure
+          another member's bank beyond the safe subset. (Writes to others' banks
+          are independently denied by the validator.)
+        - **viewer / unknown role** -> ``set()`` (read-only, fail closed).
+
+        Ownership is read from the process-local ownership snapshot (primed by
+        the HTTP extension on the API process); no extra DB/GitHub call. If the
+        snapshot is unavailable we treat the bank as unowned for the member's own
+        purposes (full config), which is safe: the validator still gates the
+        actual write.
         """
         role = parse_role_from_org_tenant_id(context.tenant_id)
         if role == ROLE_ADMIN:
             return None
-        if role == ROLE_MEMBER:
-            return set(_MEMBER_ALLOWED_FIELDS)
-        return set()
+        if role != ROLE_MEMBER:
+            # viewer or unknown -> no config writes (fail closed).
+            return set()
+
+        # Member: full config on a bank they own or that is not yet owned;
+        # curated subset on a bank owned by another user.
+        user_id = parse_user_id_from_tenant_id(context.tenant_id)
+        snapshot = get_snapshot()
+        if snapshot is not None and user_id is not None:
+            owner = snapshot.rows.get(bank_id)
+            if owner is not None and owner[0] != user_id:
+                # Owned by someone else: restrict to the safe subset.
+                return set(_MEMBER_ALLOWED_FIELDS)
+        # Owned by this member, unowned, or snapshot unavailable -> full config.
+        return None

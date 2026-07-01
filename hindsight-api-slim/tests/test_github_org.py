@@ -152,11 +152,28 @@ class TestTenantAllowedConfigFields:
         assert await t.get_allowed_config_fields(_ctx("1024", "admin"), "portal-dev") is None
 
     @pytest.mark.asyncio
-    async def test_member_with_login_allows_subset(self):
+    async def test_member_unowned_bank_allows_all(self):
+        # No snapshot primed -> unowned as far as this member is concerned ->
+        # full config (first-writer-wins: the member is about to own it).
+        t = self._tenant()
+        assert shared.get_snapshot() is None
+        assert await t.get_allowed_config_fields(_ctx("55", "member", "octocat"), "new-bank") is None
+
+    @pytest.mark.asyncio
+    async def test_member_own_bank_allows_all(self):
+        # A member owns "mine" -> full config on their own bank.
+        set_snapshot(_fresh_snapshot({"mine": ("55", VISIBILITY_PRIVATE, "octocat")}))
+        t = self._tenant()
+        assert await t.get_allowed_config_fields(_ctx("55", "member", "octocat"), "mine") is None
+
+    @pytest.mark.asyncio
+    async def test_member_other_owner_bank_restricted_to_subset(self):
         from hindsight_api.extensions.builtin.github_tenant import _MEMBER_ALLOWED_FIELDS
 
+        # Bank owned by user 999 -> member 55 gets only the curated subset.
+        set_snapshot(_fresh_snapshot({"theirs": ("999", VISIBILITY_SHARED, "someone")}))
         t = self._tenant()
-        allowed = await t.get_allowed_config_fields(_ctx("55", "member", "octocat"), "b")
+        allowed = await t.get_allowed_config_fields(_ctx("55", "member", "octocat"), "theirs")
         assert allowed == set(_MEMBER_ALLOWED_FIELDS)
 
     @pytest.mark.asyncio
