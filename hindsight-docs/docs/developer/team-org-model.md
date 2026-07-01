@@ -333,7 +333,7 @@ Access decisions (all in the authorization extension):
 | Hook                        | Rule |
 |-----------------------------|------|
 | `validate_bank_read`        | allow if bank in caller's `shared`, in caller's `owned`, or caller `is_admin`; else `reject(404)` (hide existence). |
-| `validate_bank_write`       | role must permit writes (member/admin). Then: admin → allow; owner → allow; owned by someone else → reject; **unowned → atomically claim private for the caller (first-writer-wins) and allow** (race loser rejected). |
+| `validate_bank_write`       | role must permit writes (member/admin). Then: **unowned → atomically claim private for the caller (first-writer-wins, applies to admins too) and allow** (race loser rejected); owner → allow; admin → allow (on an already-owned bank); owned by someone else → reject. |
 | `filter_bank_list`          | keep only banks in `owned ∪ shared` (admins keep all). |
 | `validate_retain`/`reflect` | role gate (viewer rejected) **and** the write check above (which auto-claims a new bank private for the caller). |
 | `validate_recall`           | allow if the caller may read the target bank (viewer allowed). |

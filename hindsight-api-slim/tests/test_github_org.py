@@ -504,8 +504,24 @@ class TestFirstWriterOwnership:
         assert called is False
 
     @pytest.mark.asyncio
-    async def test_admin_writes_unowned_without_claim(self, validator, monkeypatch):
-        # Admins may write anything and short-circuit before the claim path.
+    async def test_admin_write_unowned_bank_claims_private(self, validator, monkeypatch):
+        # Privacy-by-default is universal: an admin creating a NEW (unowned) bank
+        # also claims it private, rather than leaving it unowned/org-shared.
+        set_snapshot(_fresh_snapshot(_ROWS))
+        claimed: list[tuple[str, str]] = []
+
+        async def _fake_claim(bank_id, caller_user_id):
+            claimed.append((bank_id, caller_user_id))
+            return True
+
+        monkeypatch.setattr(validator, "_claim_bank_if_unowned", _fake_claim)
+        assert (await validator.validate_bank_write(_write_ctx("fresh", _ctx("1", ROLE_ADMIN)))).allowed
+        assert claimed == [("fresh", "1")]
+
+    @pytest.mark.asyncio
+    async def test_admin_writes_others_owned_bank_without_claim(self, validator, monkeypatch):
+        # Admins may write banks ALREADY owned by someone else (no claim; the
+        # existing owner is preserved).
         set_snapshot(_fresh_snapshot(_ROWS))
         called = False
 
@@ -515,7 +531,8 @@ class TestFirstWriterOwnership:
             return True
 
         monkeypatch.setattr(validator, "_claim_bank_if_unowned", _fake_claim)
-        assert (await validator.validate_bank_write(_write_ctx("fresh", _ctx("1", ROLE_ADMIN)))).allowed
+        # "secret" is owned by 999 (private); admin may still write it.
+        assert (await validator.validate_bank_write(_write_ctx("secret", _ctx("1", ROLE_ADMIN)))).allowed
         assert called is False
 
     @pytest.mark.asyncio

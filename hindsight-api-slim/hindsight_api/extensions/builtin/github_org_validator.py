@@ -316,16 +316,19 @@ class GitHubOrgAuthorizationExtension(OperationValidatorExtension):
 
         Requires a write-capable role. The per-bank rule is:
 
-        - **Admin**: may write any bank.
-        - **Owner**: may write banks they own.
         - **Unowned bank (no ownership row)**: the caller becomes the owner via
-          first-writer-wins and the bank is created **private**
-          (:meth:`_claim_bank_if_unowned`). This is the privacy-by-default rule:
-          a bank belongs to whoever first writes it and is not shared until the
-          owner explicitly shares it via the ``PUT .../visibility`` route.
-        - **Shared bank owned by someone else**: denied. Sharing grants *read*
-          to the org, not write; only the owner or an admin may write.
-        - **Private bank owned by someone else**: denied.
+          first-writer-wins and the bank is created **private** — this applies
+          to **admins too**. Privacy-by-default is universal: any bank belongs
+          to whoever first writes it and is not shared until its owner (or an
+          admin) explicitly shares it via the ``PUT .../visibility`` route. The
+          claim is checked *before* the admin/owner short-circuits so an admin
+          creating a bank does not leave it unowned (which would surface as
+          org-shared).
+        - **Owner**: may write banks they own.
+        - **Admin**: may write any *already-owned* bank (owned by anyone).
+        - **Shared bank owned by someone else**: denied for non-admins. Sharing
+          grants *read* to the org, not write; only the owner or an admin writes.
+        - **Private bank owned by someone else**: denied for non-admins.
 
         The ``github_org_unowned_banks`` policy no longer gates writes: the
         first writer always claims the bank private. (It only affects the
@@ -338,21 +341,27 @@ class GitHubOrgAuthorizationExtension(OperationValidatorExtension):
         view, known = resolved
         if not self._can_write(request_context.tenant_id):
             return False
+
+        # First-writer-wins claim runs BEFORE the admin/owner short-circuits so
+        # that a brand-new bank is always recorded private for its creator —
+        # including when the creator is an admin. Requires a known caller
+        # identity so we never write an empty owner.
+        if bank_id not in known:
+            caller_user_id = parse_user_id_from_tenant_id(request_context.tenant_id)
+            if caller_user_id:
+                return await self._claim_bank_if_unowned(bank_id, caller_user_id)
+            # No parseable identity: an admin may still write (e.g. maintenance),
+            # but a non-admin without identity is denied.
+            return view.is_admin
+
+        # Bank already has an owner.
         if view.is_admin:
             return True
         if bank_id in view.owned:
             return True
-        if bank_id in known:
-            # Owned by someone else (shared or private) — never writable by a
-            # non-owner, non-admin caller.
-            return False
-
-        # Unowned: first-writer-wins. Claim it private for this caller. Requires
-        # a known caller identity so we never write an empty owner.
-        caller_user_id = parse_user_id_from_tenant_id(request_context.tenant_id)
-        if not caller_user_id:
-            return False
-        return await self._claim_bank_if_unowned(bank_id, caller_user_id)
+        # Owned by someone else (shared or private) — not writable by a
+        # non-owner, non-admin caller.
+        return False
 
     # ------------------------------------------------------------------
     # Core operation hooks (abstract - required)
