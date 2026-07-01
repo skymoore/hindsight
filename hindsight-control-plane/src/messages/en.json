@@ -57,7 +57,8 @@
       "copied": "Copied to clipboard",
       "private": "Private",
       "shared": "Shared",
-      "ownedBy": "Owned by {user}"
+      "ownedBy": "Owned by {user}",
+      "ownedByYou": "Owned by you"
     },
     "viewOnGitHub": "View on GitHub"
   },
@@ -174,7 +175,8 @@
     "shareSuccess": "Bank shared with team",
     "makePrivateSuccess": "Bank made private",
     "visibilityError": "Failed to update visibility",
-    "ownedBy": "Owned by {user}"
+    "ownedBy": "Owned by {user}",
+    "ownedByYou": "Owned by you"
   },
   "bankProfile": {
     "noBankSelected": "No Bank Selected",

@@ -57,7 +57,8 @@
       "copied": "クリップボードにコピーしました",
       "private": "プライベート",
       "shared": "共有",
-      "ownedBy": "所有者: {user}"
+      "ownedBy": "所有者: {user}",
+      "ownedByYou": "所有者: あなた"
     },
     "viewOnGitHub": "GitHubで表示"
   },
@@ -174,7 +175,8 @@
     "shareSuccess": "バンクをチームと共有しました",
     "makePrivateSuccess": "バンクをプライベートにしました",
     "visibilityError": "可視性の更新に失敗しました",
-    "ownedBy": "所有者: {user}"
+    "ownedBy": "所有者: {user}",
+    "ownedByYou": "所有者: あなた"
   },
   "bankProfile": {
     "noBankSelected": "バンクが選択されていません",

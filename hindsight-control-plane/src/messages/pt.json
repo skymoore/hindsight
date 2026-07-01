@@ -57,7 +57,8 @@
       "copied": "Copiado para a área de transferência",
       "private": "Privado",
       "shared": "Compartilhado",
-      "ownedBy": "Pertence a {user}"
+      "ownedBy": "Pertence a {user}",
+      "ownedByYou": "Pertence a você"
     },
     "viewOnGitHub": "Ver no GitHub"
   },
@@ -174,7 +175,8 @@
     "shareSuccess": "Banco compartilhado com a equipe",
     "makePrivateSuccess": "Banco tornado privado",
     "visibilityError": "Falha ao atualizar a visibilidade",
-    "ownedBy": "Pertence a {user}"
+    "ownedBy": "Pertence a {user}",
+    "ownedByYou": "Pertence a você"
   },
   "bankProfile": {
     "noBankSelected": "Nenhum Banco Selecionado",

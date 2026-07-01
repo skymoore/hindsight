@@ -57,7 +57,8 @@
       "copied": "已复制到剪贴板",
       "private": "私有",
       "shared": "共享",
-      "ownedBy": "所有者：{user}"
+      "ownedBy": "所有者：{user}",
+      "ownedByYou": "所有者：你"
     },
     "viewOnGitHub": "在 GitHub 查看"
   },
@@ -174,7 +175,8 @@
     "shareSuccess": "记忆库已与团队共享",
     "makePrivateSuccess": "记忆库已设为私有",
     "visibilityError": "更新可见性失败",
-    "ownedBy": "所有者：{user}"
+    "ownedBy": "所有者：{user}",
+    "ownedByYou": "所有者：你"
   },
   "bankProfile": {
     "noBankSelected": "未选择记忆库",

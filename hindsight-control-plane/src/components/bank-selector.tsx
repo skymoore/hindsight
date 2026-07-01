@@ -574,13 +574,17 @@ function BankSelectorInner() {
                                 : tNavBank("shared")}
                             </span>
                           )}
-                          {bank.ownerLogin && !bank.isOwner && (
+                          {(bank.ownerLogin || bank.isOwner) && (
                             <span
                               className="inline-flex items-center gap-1 shrink-0 text-[11px] text-muted-foreground/70"
-                              title={tNavBank("ownedBy", { user: bank.ownerLogin })}
+                              title={
+                                bank.isOwner
+                                  ? tNavBank("ownedByYou")
+                                  : tNavBank("ownedBy", { user: bank.ownerLogin as string })
+                              }
                             >
                               <User className="h-3 w-3" />
-                              {bank.ownerLogin}
+                              {bank.isOwner ? tCommon("you") : bank.ownerLogin}
                             </span>
                           )}
                           <button

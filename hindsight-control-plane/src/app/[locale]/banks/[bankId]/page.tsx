@@ -295,10 +295,12 @@ export default function BankPage() {
                           {t("health")}
                         </DropdownMenuItem>
                       )}
-                      {ownerLogin && !isOwner && (
+                      {(ownerLogin || isOwner) && (
                         <DropdownMenuItem disabled>
                           <User className="w-4 h-4 mr-2" />
-                          {t("ownedBy", { user: ownerLogin })}
+                          {isOwner
+                            ? t("ownedByYou")
+                            : t("ownedBy", { user: ownerLogin as string })}
                         </DropdownMenuItem>
                       )}
                       {canShare && visibility && (
