@@ -395,6 +395,62 @@ class TestValidatorSelfPrime:
         assert not (await validator.validate_bank_read(_read_ctx("secret", member))).allowed
 
 
+class TestValidatorRefreshSnapshotQuery:
+    """Exercise the real ``_refresh_snapshot`` DB path against a fake pool.
+
+    Regression cover for two bugs: (1) the SELECT must include ``owner_login``
+    and build 3-tuples matching ``OrgSnapshot.rows`` (else callers unpacking
+    ``(owner_user_id, visibility, owner_login)`` raise "expected 3, got 2");
+    (2) ``_ensure_table`` must run before the SELECT so a fresh/reset DB (no
+    ``bank_ownership`` table yet) does not fail the whole snapshot closed.
+    """
+
+    @staticmethod
+    def _fake_pool(records, executed):
+        conn = MagicMock()
+        conn.execute = AsyncMock(side_effect=lambda sql, *a: executed.append(sql))
+        conn.fetch = AsyncMock(return_value=records)
+
+        acquire_cm = MagicMock()
+        acquire_cm.__aenter__ = AsyncMock(return_value=conn)
+        acquire_cm.__aexit__ = AsyncMock(return_value=False)
+        pool = MagicMock()
+        pool.acquire = MagicMock(return_value=acquire_cm)
+        return pool, conn
+
+    @pytest.mark.asyncio
+    async def test_refresh_selects_owner_login_and_builds_three_tuples(self, validator, monkeypatch):
+        executed: list[str] = []
+        records = [
+            {"bank_id": "mine", "owner_user_id": "1024", "owner_login": "alice", "visibility": VISIBILITY_PRIVATE},
+            {"bank_id": "team", "owner_user_id": "2048", "owner_login": None, "visibility": VISIBILITY_SHARED},
+        ]
+        pool, conn = self._fake_pool(records, executed)
+        monkeypatch.setattr(validator_module, "ensure_pool_via_context", AsyncMock(return_value=pool))
+
+        snapshot = await validator._refresh_snapshot()
+
+        assert snapshot is not None
+        # Rows are 3-tuples: (owner_user_id, visibility, owner_login).
+        assert snapshot.rows["mine"] == ("1024", VISIBILITY_PRIVATE, "alice")
+        assert snapshot.rows["team"] == ("2048", VISIBILITY_SHARED, None)
+        # The SELECT column list must include owner_login.
+        assert "owner_login" in conn.fetch.await_args.args[0]
+
+    @pytest.mark.asyncio
+    async def test_refresh_ensures_table_before_select(self, validator, monkeypatch):
+        # On a fresh DB the table must be created (CREATE TABLE IF NOT EXISTS)
+        # before the SELECT; _ensure_table issues the CREATE via conn.execute.
+        executed: list[str] = []
+        pool, _conn = self._fake_pool([], executed)
+        monkeypatch.setattr(validator_module, "ensure_pool_via_context", AsyncMock(return_value=pool))
+
+        snapshot = await validator._refresh_snapshot()
+
+        assert snapshot is not None
+        assert any("CREATE TABLE IF NOT EXISTS" in sql for sql in executed), executed
+
+
 class TestValidatorPerBankAccess:
     @pytest.mark.asyncio
     async def test_member_reads_owned_and_shared(self, validator):

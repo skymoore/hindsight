@@ -172,9 +172,17 @@ class GitHubOrgAuthorizationExtension(OperationValidatorExtension):
 
             table = fq_table(BANK_OWNERSHIP_TABLE)
             async with pool.acquire() as conn:
-                records = await conn.fetch(f"SELECT bank_id, owner_user_id, visibility FROM {table}")
-            rows: dict[str, tuple[str, str]] = {
-                record["bank_id"]: (record["owner_user_id"], record["visibility"]) for record in records
+                # Ensure the table (and owner_login column) exist before reading.
+                # On a fresh/reset DB the table is created lazily; without this a
+                # cold read would raise UndefinedTableError and fail the whole
+                # snapshot closed until a write route ran _ensure_table.
+                await self._ensure_table(conn)
+                records = await conn.fetch(
+                    f"SELECT bank_id, owner_user_id, owner_login, visibility FROM {table}"
+                )
+            rows: dict[str, tuple[str, str, str | None]] = {
+                record["bank_id"]: (record["owner_user_id"], record["visibility"], record["owner_login"])
+                for record in records
             }
             snapshot = OrgSnapshot(rows=rows, fetched_at=time.monotonic())
             set_snapshot(snapshot)
