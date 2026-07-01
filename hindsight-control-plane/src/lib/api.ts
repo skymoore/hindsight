@@ -31,6 +31,25 @@ function describeErrorDetails(details: unknown): string | undefined {
   return String(details);
 }
 
+/**
+ * Error thrown by {@link ControlPlaneClient.fetchApi} for failed requests.
+ * Carries the HTTP `status` and raw `details` for all errors, plus structured
+ * `code`/`conflicts` fields when the dataplane reports an ambiguous bare bank id
+ * (`code === "AMBIGUOUS_BANK_ID"`). Callers can `instanceof ApiError` and read
+ * `conflicts` to render the fully-qualified ids the id could refer to.
+ */
+export class ApiError extends Error {
+  status?: number;
+  details?: unknown;
+  code?: string;
+  conflicts?: string[];
+
+  constructor(message: string) {
+    super(message);
+    this.name = "ApiError";
+  }
+}
+
 export interface WebhookHttpConfig {
   method: string;
   timeout_seconds: number;
@@ -235,12 +254,25 @@ export class ControlPlaneClient {
         // Try to parse error response
         let errorMessage = `HTTP ${response.status}`;
         let errorDetails: unknown;
+        // Structured ambiguity payload (bare bank id resolves to >1 schema).
+        let ambiguityCode: string | undefined;
+        let ambiguityConflicts: string[] | undefined;
 
         try {
           const errorData = await response.json();
           if (isClientError) {
             errorMessage = errorData.error || errorMessage;
             errorDetails = errorData.details ?? errorData.detail ?? errorData.upstream?.detail;
+            // Preserve the ambiguity code + conflicts so the UI can list the
+            // fully-qualified ids the bare id could refer to.
+            if (errorData.code === "AMBIGUOUS_BANK_ID") {
+              ambiguityCode = errorData.code;
+              if (Array.isArray(errorData.conflicts)) {
+                ambiguityConflicts = errorData.conflicts.filter(
+                  (c: unknown): c is string => typeof c === "string"
+                );
+              }
+            }
           }
         } catch {
           if (isClientError) {
@@ -284,9 +316,13 @@ export class ControlPlaneClient {
         }
 
         // Still throw error for callers that want to handle it
-        const error = new Error(description || errorMessage);
-        (error as any).status = response.status;
-        (error as any).details = errorDetails;
+        const error = new ApiError(description || errorMessage);
+        error.status = response.status;
+        error.details = errorDetails;
+        if (ambiguityCode) {
+          error.code = ambiguityCode;
+          error.conflicts = ambiguityConflicts;
+        }
         throw error;
       }
 
@@ -314,7 +350,9 @@ export class ControlPlaneClient {
    * Create a new bank
    */
   async createBank(bankId: string) {
-    return this.fetchApi<{ bank_id: string }>("/api/banks", {
+    // `shadowed_by` is present (non-null) only when another accessible bank
+    // shares this bare id in a different schema — advisory, never blocking.
+    return this.fetchApi<{ bank_id: string; shadowed_by?: string[] | null }>("/api/banks", {
       method: "POST",
       body: JSON.stringify({ bank_id: bankId }),
     });

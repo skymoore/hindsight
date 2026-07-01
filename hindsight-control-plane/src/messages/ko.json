@@ -54,7 +54,10 @@
       "switchTitle": "메모리 뱅크 전환",
       "returnTo": "{bank}로 돌아가기",
       "copyName": "이름 복사",
-      "copied": "클립보드에 복사됨"
+      "copied": "클립보드에 복사됨",
+      "createInSchema": "Create in",
+      "personalSchema": "Personal (your private banks)",
+      "shadowedTooltip": "This id also exists in {schemas}. Refer to this bank by its fully-qualified id to avoid ambiguity."
     },
     "viewOnGitHub": "GitHub에서 보기"
   },
@@ -166,6 +169,14 @@
     "deleteWillDeleteDetails": "{memories, plural, other {# 메모리}}, {documents, plural, other {# 문서}}, {links, plural, other {# 링크}}가 삭제됩니다.",
     "deleteWillDeleteObservations": "{count, plural, other {# 관찰}}이 삭제됩니다.",
     "memoryDefense": "메모리 방어"
+  },
+  "bankPage": {
+    "shadowBanner": "This bank's id also exists in {schemas}. This view refers to {qualified}. Use fully-qualified ids to avoid ambiguity."
+  },
+  "bankConflict": {
+    "title": "Ambiguous bank id",
+    "body": "This id exists in multiple schemas you can access. Refer to the bank by one of its fully-qualified ids:",
+    "copy": "Copy id"
   },
   "bankProfile": {
     "noBankSelected": "선택된 뱅크 없음",
@@ -1558,7 +1569,8 @@
     "observationScopesEmpty": "관찰 범위를 미리 보려면 위에 태그를 추가하세요",
     "metadataHelpText": "한 줄에 하나의 <code>key: value</code>",
     "entitiesHelpText": "자동 추출된 엔터티와 병합되는 쉼표로 구분된 힌트",
-    "textNotStoredWarning": "이 서버에는 문서 원본 텍스트가 저장되지 않습니다. 추출된 메모리만 보관됩니다."
+    "textNotStoredWarning": "이 서버에는 문서 원본 텍스트가 저장되지 않습니다. 추출된 메모리만 보관됩니다.",
+    "createShadowWarning": "Heads up: a bank named '{bank}' also exists in {schemas}. To use either unambiguously, refer to them by their fully-qualified ids."
   },
   "dashboard": {
     "welcome": "Hindsight에 오신 것을 환영합니다",

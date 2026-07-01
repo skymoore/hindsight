@@ -54,7 +54,10 @@
       "switchTitle": "Trocar banco de memória",
       "returnTo": "Voltar para {bank}",
       "copyName": "Copiar nome",
-      "copied": "Copiado para a área de transferência"
+      "copied": "Copiado para a área de transferência",
+      "createInSchema": "Create in",
+      "personalSchema": "Personal (your private banks)",
+      "shadowedTooltip": "This id also exists in {schemas}. Refer to this bank by its fully-qualified id to avoid ambiguity."
     },
     "viewOnGitHub": "Ver no GitHub"
   },
@@ -166,6 +169,14 @@
     "deleteWillDeleteDetails": "Isso excluirá {memories, plural, one {# memória} other {# memórias}}, {documents, plural, one {# documento} other {# documentos}} e {links, plural, one {# link} other {# links}}.",
     "deleteWillDeleteObservations": "Isso excluirá {count, plural, one {# observação} other {# observações}}.",
     "memoryDefense": "Defesa da memória"
+  },
+  "bankPage": {
+    "shadowBanner": "This bank's id also exists in {schemas}. This view refers to {qualified}. Use fully-qualified ids to avoid ambiguity."
+  },
+  "bankConflict": {
+    "title": "Ambiguous bank id",
+    "body": "This id exists in multiple schemas you can access. Refer to the bank by one of its fully-qualified ids:",
+    "copy": "Copy id"
   },
   "bankProfile": {
     "noBankSelected": "Nenhum Banco Selecionado",
@@ -1558,7 +1569,8 @@
     "observationScopesEmpty": "Adicione tags acima para visualizar os escopos de observação",
     "metadataHelpText": "Um <code>key: value</code> por linha",
     "entitiesHelpText": "Sugestões separadas por vírgula mescladas com entidades extraídas automaticamente",
-    "textNotStoredWarning": "O texto bruto do documento não será armazenado neste servidor — apenas as memórias extraídas são mantidas."
+    "textNotStoredWarning": "O texto bruto do documento não será armazenado neste servidor — apenas as memórias extraídas são mantidas.",
+    "createShadowWarning": "Heads up: a bank named '{bank}' also exists in {schemas}. To use either unambiguously, refer to them by their fully-qualified ids."
   },
   "dashboard": {
     "welcome": "Bem-vindo ao Hindsight",

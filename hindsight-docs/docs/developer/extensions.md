@@ -476,10 +476,42 @@ Team slugs are matched case-insensitively. A user who is a member of the `fronte
 | Actor | Capability |
 | --- | --- |
 | Any member of a shared schema | Read (recall/reflect) and write (retain) to all banks in that schema |
-| `admin` role (GitHub) | May create, deregister, and destructively drop (delete all data of) shared schemas via the API |
+| `admin` role (GitHub) | Sees, reads, and writes **every** registered shared schema (regardless of team membership); may create, deregister, and destructively drop (delete all data of) shared schemas via the API |
 | Non-admin / `member` / `viewer` | Cannot create, deregister, or drop shared schemas |
 
 Shared schemas follow the same read-many/write-many model: there is no read-only membership tier at the schema level. If you need read-only access to a shared schema, gate it at the `OperationValidatorExtension` layer.
+
+**Admin visibility & access.** Because admins manage the whole fleet, they see and can access every registered shared schema — including ones their own team is not mapped to via `shared_schema_map`. This is what makes an admin able to administer a `shared_dev` schema created for the `dev` team even though the admin is only on `sre`. Non-admins only ever see and access schemas their membership grants.
+
+**Bank id resolution.** Bank ids arrive in two forms and are resolved at request time:
+
+- **Bare** (`docs`) — the engine searches every schema the caller can access (their private schema plus any readable/writable shared schemas; admins additionally search the full registry) for a bank with that id:
+  - **0 matches** → routes to the caller's private schema. On a write this lazily creates the bank there; on a read it surfaces as a normal `404`.
+  - **1 match** → routes to whichever schema holds it (private or shared). When the match is a shared schema, a write triggers the usual first-write bootstrap for that schema.
+  - **≥2 matches** → the bare id is ambiguous and the request fails with `409 Conflict` and body `{"code": "AMBIGUOUS_BANK_ID", "conflicts": [...]}`, where `conflicts` lists the fully-qualified ids (e.g. `["user_alice/docs", "shared_dev/docs"]`). Retry using a fully-qualified id.
+- **Qualified** (`shared_dev/docs`) — routes directly to the named shared schema after the membership and registry checks; no search is performed.
+
+Nothing is blocked at create time: two banks in two different schemas may share a bare id. The ambiguity is only reported when a bare id is actually used to address a bank that now lives in more than one accessible schema.
+
+**Shadow advisories.** When the same bare id exists in more than one accessible schema, responses surface an advisory so callers can disambiguate proactively — these are informational only and **never block** an operation:
+
+- `shadowed_by` — on the bank list (`GET /v1/shared/banks`-style listings) and the create/update bank response. Lists the fully-qualified ids of the *other* banks sharing this bank's bare id. Omitted (null) when there are no shadows.
+- `resolved_to` — on the retain response. Set to the fully-qualified id (e.g. `shared_dev/docs`) only when a bare id resolved to a non-primary (shared) schema; omitted otherwise. Retain responses also carry `shadowed_by`.
+
+Because advisories are computed at request time from current membership + registry state, they are membership-change-safe: gaining or losing access to a shared schema changes what shadows you see without any migration.
+
+**Worked example.** Alice (private schema `user_alice`) creates a bank `docs`. Separately, a `shared_dev/docs` bank exists in a shared schema Alice can access. Both are allowed to coexist. As soon as Alice can reach both, addressing the bare id `docs` returns:
+
+```json
+{
+  "error": "Bank id 'docs' is ambiguous",
+  "detail": "This id exists in multiple schemas you can access. Refer to the bank by its fully-qualified id.",
+  "conflicts": ["user_alice/docs", "shared_dev/docs"],
+  "code": "AMBIGUOUS_BANK_ID"
+}
+```
+
+Alice resolves this by addressing `user_alice/docs` or `shared_dev/docs` explicitly.
 
 Creating, deregistering, or destructively dropping a shared schema is an admin-only operation. For `GitHubTenantExtension`, "admin" means the user's resolved role is `admin` (i.e. they are in one of the `HINDSIGHT_API_TENANT_GITHUB_ADMIN_TEAMS`). For `OidcTenantExtension`, admin gating is enforced by the API layer based on the caller's resolved role.
 

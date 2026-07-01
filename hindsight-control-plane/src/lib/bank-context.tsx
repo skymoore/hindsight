@@ -12,6 +12,10 @@ export interface BankInfo {
   updated_at: string | null;
   fact_count: number;
   last_document_at: string | null;
+  // Fully-qualified ids of OTHER accessible banks that share this bank's bare
+  // id in a different schema. Present/non-empty only when a shadow exists;
+  // advisory only (used to warn about ambiguous bare-id references).
+  shadowed_by?: string[] | null;
 }
 
 interface BankContextType {
@@ -44,6 +48,7 @@ export function BankProvider({ children }: { children: React.ReactNode }) {
           updated_at: bank.updated_at ?? null,
           fact_count: bank.fact_count ?? 0,
           last_document_at: bank.last_document_at ?? null,
+          shadowed_by: bank.shadowed_by ?? null,
         })) || [];
       setBankInfos(infos);
     } catch (error) {

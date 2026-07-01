@@ -192,6 +192,31 @@ async def get_or_create_bank_profile(pool, bank_id: str) -> BankProfileResult:
         return await get_or_create_bank_profile_on_conn(conn, bank_id, ops=pool.ops)
 
 
+async def bank_id_exists_in_schema(pool, bank_id: str, schema: str) -> bool:
+    """Return True if ``bank_id`` exists in the ``banks`` table of ``schema``.
+
+    Uses an explicit schema (``fq_table_explicit``) rather than the current-schema
+    contextvar, so callers can probe schemas other than the active one (e.g. to
+    enforce cross-schema bank-id uniqueness). Missing/undefined schemas are
+    treated as "no such bank" rather than raising, so a registered-but-not-yet-
+    migrated shared schema does not break the check.
+    """
+    from ..schema import fq_table_explicit
+
+    banks_table = fq_table_explicit("banks", schema)
+    async with acquire_with_retry(pool) as conn:
+        try:
+            row = await conn.fetchrow(
+                f"SELECT 1 FROM {banks_table} WHERE bank_id = $1",
+                bank_id,
+            )
+        except Exception as e:  # noqa: BLE001
+            # UndefinedTableError / invalid schema → treat as absent.
+            logger.debug("bank_id_exists_in_schema: probe of %s.banks failed (%s); treating as absent", schema, e)
+            return False
+    return row is not None
+
+
 async def get_or_create_bank_profile_on_conn(conn, bank_id: str, *, ops) -> BankProfileResult:
     """
     Connection-bound variant of ``get_or_create_bank_profile``.

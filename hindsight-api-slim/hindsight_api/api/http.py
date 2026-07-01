@@ -27,7 +27,7 @@ from hindsight_api.engine.audit import (
     AuditLogStatsResponse,
 )
 from hindsight_api.engine.llm_trace import LLMRequestListResponse, LLMRequestStatsResponse
-from hindsight_api.extensions import AuthenticationError, PrecheckOperation
+from hindsight_api.extensions import AmbiguousBankIdError, AuthenticationError, PrecheckOperation
 
 
 def _parse_metadata(metadata: Any) -> dict[str, Any]:
@@ -804,6 +804,21 @@ class RetainResponse(BaseModel):
         default=None,
         description="Token usage metrics for LLM calls during fact extraction (only present for synchronous operations)",
     )
+    resolved_to: str | None = Field(
+        default=None,
+        description=(
+            "Advisory: the fully-qualified id a bare bank_id resolved to when it mapped to a "
+            "non-primary (shared) schema, e.g. 'shared_dev/docs'. Omitted when the bare id "
+            "resolved to your primary schema or a qualified id was supplied."
+        ),
+    )
+    shadowed_by: list[str] | None = Field(
+        default=None,
+        description=(
+            "Advisory: fully-qualified ids of banks in other schemas you can access that share "
+            "this bank's bare id. Present only when at least one shadow exists. Never blocks retain."
+        ),
+    )
 
 
 class FileRetainResponse(BaseModel):
@@ -1097,6 +1112,52 @@ class BankProfileResponse(BaseModel):
     mission: str = Field(description="The agent's mission - who they are and what they're trying to accomplish")
     # Deprecated: use mission instead. Kept for backwards compatibility.
     background: str | None = Field(default=None, description="Deprecated: use mission instead")
+    shadowed_by: list[str] | None = Field(
+        default=None,
+        description=(
+            "Advisory: fully-qualified ids of banks in other schemas you can access that "
+            "share this bank's bare id. Present only when at least one shadow exists. "
+            "Never blocks the operation; refer to a bank by its fully-qualified id to be unambiguous."
+        ),
+    )
+
+
+class AmbiguousBankIdResponse(BaseModel):
+    """409 response body when a bare bank id resolves to multiple accessible schemas.
+
+    Returned when the same bare id exists in two or more schemas the caller can
+    access. The caller must refer to the bank by one of the fully-qualified ids
+    listed in ``conflicts`` instead.
+    """
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "error": "Bank id 'docs' is ambiguous",
+                "detail": (
+                    "This id exists in multiple schemas you can access. "
+                    "Refer to the bank by its fully-qualified id."
+                ),
+                "conflicts": ["user_alice/docs", "shared_dev/docs"],
+                "code": "AMBIGUOUS_BANK_ID",
+            }
+        }
+    )
+
+    error: str
+    detail: str
+    conflicts: list[str] = Field(description="Fully-qualified ids the bare id resolves to")
+    code: str = Field(default="AMBIGUOUS_BANK_ID", description="Machine-readable error code")
+
+
+# Reusable OpenAPI `responses` entry for routes that resolve a bare bank id and
+# can therefore return a 409 AMBIGUOUS_BANK_ID from the global handler.
+_AMBIGUOUS_BANK_ID_RESPONSES = {
+    409: {
+        "model": AmbiguousBankIdResponse,
+        "description": "Bare bank id is ambiguous across accessible schemas (AMBIGUOUS_BANK_ID).",
+    }
+}
 
 
 class UpdateDispositionRequest(BaseModel):
@@ -1170,6 +1231,13 @@ class BankListItem(BaseModel):
     updated_at: str | None = None
     fact_count: int = 0
     last_document_at: str | None = None
+    shadowed_by: list[str] | None = Field(
+        default=None,
+        description=(
+            "Advisory: fully-qualified ids of other banks (in schemas you can access) that "
+            "share this bank's bare id. Present only when at least one shadow exists."
+        ),
+    )
 
 
 class BankListResponse(BaseModel):
@@ -3484,6 +3552,26 @@ def _register_routes(app: FastAPI):
             content={"detail": str(exc)},
         )
 
+    # Global exception handler for ambiguous bare bank ids. A bare id that
+    # resolves to more than one accessible schema is a 409: the caller must
+    # refer to the bank by its fully-qualified id instead.
+    @app.exception_handler(AmbiguousBankIdError)
+    async def ambiguous_bank_id_handler(request, exc: AmbiguousBankIdError):
+        from fastapi.responses import JSONResponse
+
+        return JSONResponse(
+            status_code=409,
+            content={
+                "error": f"Bank id '{exc.bank_id}' is ambiguous",
+                "detail": (
+                    "This id exists in multiple schemas you can access. "
+                    "Refer to the bank by its fully-qualified id."
+                ),
+                "conflicts": exc.conflicts,
+                "code": "AMBIGUOUS_BANK_ID",
+            },
+        )
+
     @app.get(
         "/health",
         summary="Health check endpoint",
@@ -3853,6 +3941,7 @@ def _register_routes(app: FastAPI):
         "- `world`: General knowledge about people, places, events, and things that happen\n"
         "- `experience`: Memories about experience, conversations, actions taken, and tasks performed",
         operation_id="recall_memories",
+        responses=_AMBIGUOUS_BANK_ID_RESPONSES,
         tags=["Memory"],
     )
     @audited("recall")
@@ -4024,7 +4113,7 @@ def _register_routes(app: FastAPI):
             raise
         except OperationValidationError as e:
             raise HTTPException(status_code=e.status_code, detail=e.reason)
-        except (AuthenticationError, HTTPException):
+        except (AmbiguousBankIdError, AuthenticationError, HTTPException):
             raise
         except (asyncio.TimeoutError, TimeoutError):
             handler_duration = time.time() - handler_start
@@ -4057,6 +4146,7 @@ def _register_routes(app: FastAPI):
         "4. Uses LLM to formulate a contextual answer\n"
         "5. Returns plain text answer and the facts used",
         operation_id="reflect",
+        responses=_AMBIGUOUS_BANK_ID_RESPONSES,
         tags=["Memory"],
     )
     @audited("reflect")
@@ -4174,7 +4264,7 @@ def _register_routes(app: FastAPI):
 
         except OperationValidationError as e:
             raise HTTPException(status_code=e.status_code, detail=e.reason)
-        except (AuthenticationError, HTTPException):
+        except (AmbiguousBankIdError, AuthenticationError, HTTPException):
             raise
         except LLMNotAvailableError as e:
             raise HTTPException(status_code=400, detail=str(e))
@@ -5545,6 +5635,7 @@ def _register_routes(app: FastAPI):
         summary="Get memory bank profile",
         description="Get disposition traits and mission for a memory bank. Returns 404 if the bank does not exist.",
         operation_id="get_bank_profile",
+        responses=_AMBIGUOUS_BANK_ID_RESPONSES,
         tags=["Banks"],
         deprecated=True,
     )
@@ -5576,7 +5667,7 @@ def _register_routes(app: FastAPI):
             )
         except OperationValidationError as e:
             raise HTTPException(status_code=e.status_code, detail=e.reason)
-        except (AuthenticationError, HTTPException):
+        except (AmbiguousBankIdError, AuthenticationError, HTTPException):
             raise
         except Exception as e:
             import traceback
@@ -5666,6 +5757,7 @@ def _register_routes(app: FastAPI):
         summary="Create or update memory bank",
         description="Create a new agent or update existing agent with disposition and mission. Auto-fills missing fields with defaults.",
         operation_id="create_or_update_bank",
+        responses=_AMBIGUOUS_BANK_ID_RESPONSES,
         tags=["Banks"],
     )
     @audited("create_bank")
@@ -5698,16 +5790,19 @@ def _register_routes(app: FastAPI):
                 else dict(final_profile["disposition"])
             )
             mission = final_profile.get("mission") or ""
+            # Advisory shadow info: other accessible schemas holding this bare id.
+            shadows = await app.state.memory.get_bank_shadows(bank_id, request_context=request_context)
             return BankProfileResponse(
                 bank_id=bank_id,
                 name=final_profile["name"],
                 disposition=DispositionTraits(**disposition_dict),
                 mission=mission,
                 background=mission,  # Backwards compat
+                shadowed_by=shadows or None,
             )
         except OperationValidationError as e:
             raise HTTPException(status_code=e.status_code, detail=e.reason)
-        except (AuthenticationError, HTTPException):
+        except (AmbiguousBankIdError, AuthenticationError, HTTPException):
             raise
         except Exception as e:
             import traceback
@@ -6726,6 +6821,7 @@ def _register_routes(app: FastAPI):
         "**When `async=false` (default):** Waits for processing to complete.\n\n"
         "**Note:** If a memory item has a `document_id` that already exists, the old document and its memory units will be deleted before creating new ones (upsert behavior).",
         operation_id="retain_memories",
+        responses=_AMBIGUOUS_BANK_ID_RESPONSES,
         tags=["Memory"],
     )
     @audited("retain")
@@ -6766,6 +6862,21 @@ def _register_routes(app: FastAPI):
                     content_dict["update_mode"] = item.update_mode
                 strategy_groups[effective].append(content_dict)
 
+            # Advisory shadow/resolution info (best-effort, never blocks retain).
+            # Computed after the write below so a first-write bare→shared retain
+            # reflects the freshly-resolved schema; declared here so both the
+            # async and sync return branches can populate it.
+            async def _retain_advisory() -> tuple[str | None, list[str] | None]:
+                try:
+                    resolved_to, shadowed_by = await app.state.memory.get_bank_resolution_advisory(
+                        bank_id, write=False, request_context=request_context
+                    )
+                    return resolved_to, (shadowed_by or None)
+                except AmbiguousBankIdError:
+                    raise
+                except Exception:  # noqa: BLE001 — advisory only, must not fail retain.
+                    return None, None
+
             if request.async_:
                 # Async processing: one submit per strategy group
                 all_operation_ids = []
@@ -6780,6 +6891,7 @@ def _register_routes(app: FastAPI):
                     )
                     all_operation_ids.append(result["operation_id"])
                     total_items_count += result["items_count"]
+                resolved_to, shadowed_by = await _retain_advisory()
                 return RetainResponse.model_validate(
                     {
                         "success": True,
@@ -6788,6 +6900,8 @@ def _register_routes(app: FastAPI):
                         "async": True,
                         "operation_id": all_operation_ids[0] if all_operation_ids else None,
                         "operation_ids": all_operation_ids if len(all_operation_ids) > 1 else None,
+                        "resolved_to": resolved_to,
+                        "shadowed_by": shadowed_by,
                     }
                 )
             else:
@@ -6832,6 +6946,7 @@ def _register_routes(app: FastAPI):
                                 total_tokens=total_usage.total_tokens + usage.total_tokens,
                             )
 
+                resolved_to, shadowed_by = await _retain_advisory()
                 return RetainResponse.model_validate(
                     {
                         "success": True,
@@ -6839,11 +6954,13 @@ def _register_routes(app: FastAPI):
                         "items_count": total_items_count,
                         "async": False,
                         "usage": total_usage,
+                        "resolved_to": resolved_to,
+                        "shadowed_by": shadowed_by,
                     }
                 )
         except OperationValidationError as e:
             raise HTTPException(status_code=e.status_code, detail=e.reason)
-        except (AuthenticationError, HTTPException):
+        except (AmbiguousBankIdError, AuthenticationError, HTTPException):
             raise
         except ValueError as e:
             # Invalid request parameters (e.g. duplicate document_ids, or

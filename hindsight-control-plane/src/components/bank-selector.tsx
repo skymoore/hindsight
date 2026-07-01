@@ -7,8 +7,9 @@ import { useTranslations } from "next-intl";
 import { useBank } from "@/lib/bank-context";
 import { bankRoute } from "@/lib/bank-url";
 import { withBasePath } from "@/lib/base-path";
-import { client } from "@/lib/api";
+import { client, ApiError } from "@/lib/api";
 import { LanguageSwitcher } from "@/components/language-switcher";
+import { BankConflictAlert } from "@/components/bank-conflict-alert";
 import { Button } from "@/components/ui/button";
 import {
   Command,
@@ -43,6 +44,7 @@ import {
   LogOut,
   Copy,
   Users,
+  AlertTriangle,
 } from "lucide-react";
 import { toast } from "sonner";
 import { useTheme } from "@/lib/theme-context";
@@ -105,6 +107,15 @@ function BankSelectorInner() {
   const [newBankId, setNewBankId] = React.useState("");
   const [isCreating, setIsCreating] = React.useState(false);
   const [createError, setCreateError] = React.useState<string | null>(null);
+  // Fully-qualified ids conflicting with the entered bare id (AMBIGUOUS_BANK_ID).
+  const [createConflicts, setCreateConflicts] = React.useState<string[] | null>(null);
+  // Target schema for a new bank: "" = personal/private schema; otherwise a
+  // writable shared schema name. Writable shared schemas are loaded when the
+  // create dialog opens.
+  const [createTargetSchema, setCreateTargetSchema] = React.useState("");
+  const [writableSharedSchemas, setWritableSharedSchemas] = React.useState<
+    { schema_name: string; display_name?: string | null }[]
+  >([]);
   const [useTemplate, setUseTemplate] = React.useState(false);
   const [templateJson, setTemplateJson] = React.useState("");
   const [templateError, setTemplateError] = React.useState<string | null>(null);
@@ -200,16 +211,58 @@ function BankSelectorInner() {
     [sortedBanks]
   );
 
+  // Load the shared schemas the user may WRITE to, so a new bank can be created
+  // inside one of them (in addition to the user's personal schema).
+  React.useEffect(() => {
+    if (!createDialogOpen) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const resp = await fetch(withBasePath("/api/shared/schemas"), { cache: "no-store" });
+        if (!resp.ok) return;
+        const body = (await resp.json().catch(() => null)) as {
+          shared?: { schema_name: string; display_name?: string | null; writable?: boolean }[];
+        } | null;
+        if (cancelled) return;
+        const writable = (body?.shared ?? []).filter((s) => s.writable !== false);
+        setWritableSharedSchemas(writable);
+      } catch {
+        /* non-fatal: fall back to personal-only */
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [createDialogOpen]);
+
   const handleCreateBank = async () => {
     if (!newBankId.trim()) return;
 
     setIsCreating(true);
     setCreateError(null);
+    setCreateConflicts(null);
     setTemplateError(null);
+
+    // Qualify the bank id with the chosen shared schema, if any. A bare id
+    // targets the user's personal schema; "schema/bank_id" targets a shared one.
+    const bareId = newBankId.trim();
+    const qualifiedId = createTargetSchema ? `${createTargetSchema}/${bareId}` : bareId;
 
     try {
       // Create the bank first
-      await client.createBank(newBankId.trim());
+      const created = await client.createBank(qualifiedId);
+
+      // Advisory: another accessible bank shares this bare id in another schema.
+      // Warn (non-blocking) so the user knows to use fully-qualified ids.
+      const shadowedBy = created?.shadowed_by;
+      if (shadowedBy && shadowedBy.length > 0) {
+        toast.warning(
+          tAddDocument("createShadowWarning", {
+            bank: bareId,
+            schemas: shadowedBy.join(", "),
+          })
+        );
+      }
 
       // If template JSON is provided, import it
       if (templateJson.trim()) {
@@ -223,7 +276,7 @@ function BankSelectorInner() {
         }
 
         try {
-          await client.importBankTemplate(newBankId.trim(), manifest);
+          await client.importBankTemplate(qualifiedId, manifest);
         } catch (importError) {
           setTemplateError(
             importError instanceof Error
@@ -238,13 +291,21 @@ function BankSelectorInner() {
       await loadBanks();
       setCreateDialogOpen(false);
       setNewBankId("");
+      setCreateTargetSchema("");
       setTemplateJson("");
       setTemplateError(null);
-      // Navigate to the new bank
-      setCurrentBank(newBankId.trim());
-      router.push(bankRoute(newBankId.trim(), "?view=data"));
+      setCreateConflicts(null);
+      // Navigate to the new bank (use the qualified id so shared banks resolve)
+      setCurrentBank(qualifiedId);
+      router.push(bankRoute(qualifiedId, "?view=data"));
     } catch (error) {
-      setCreateError(error instanceof Error ? error.message : tAddDocument("failedToCreateBank"));
+      // A bare id can collide with the same id in a shared schema the user can
+      // access — surface the conflicts inline so they can qualify the id.
+      if (error instanceof ApiError && error.code === "AMBIGUOUS_BANK_ID" && error.conflicts) {
+        setCreateConflicts(error.conflicts);
+      } else {
+        setCreateError(error instanceof Error ? error.message : tAddDocument("failedToCreateBank"));
+      }
     } finally {
       setIsCreating(false);
     }
@@ -495,6 +556,8 @@ function BankSelectorInner() {
     const isShared = slashIndex !== -1;
     const schemaPrefix = isShared ? bank.bank_id.slice(0, slashIndex) : "";
     const bankLabel = isShared ? bank.bank_id.slice(slashIndex + 1) : bank.bank_id;
+    const shadowedBy = bank.shadowed_by;
+    const isShadowed = !!shadowedBy && shadowedBy.length > 0;
     return (
       <CommandItem
         key={bank.bank_id}
@@ -524,9 +587,19 @@ function BankSelectorInner() {
               {schemaPrefix}
             </span>
           )}
-          <span className="truncate flex-1 font-medium" title={bank.bank_id}>
+          <span className="truncate font-medium" title={bank.bank_id}>
             {bankLabel}
           </span>
+          {isShadowed && (
+            <span
+              className="inline-flex shrink-0"
+              aria-label={tNavBank("shadowedTooltip", { schemas: shadowedBy!.join(", ") })}
+              title={tNavBank("shadowedTooltip", { schemas: shadowedBy!.join(", ") })}
+            >
+              <AlertTriangle className="h-3.5 w-3.5 text-amber-500" />
+            </span>
+          )}
+          <span className="flex-1" />
           <button
             type="button"
             aria-label={tNavBank("copyName")}
@@ -727,6 +800,25 @@ function BankSelectorInner() {
               <DialogTitle>{tAddDocument("createBankTitle")}</DialogTitle>
             </DialogHeader>
             <div className="py-4 space-y-4">
+              {writableSharedSchemas.length > 0 && (
+                <div className="space-y-1">
+                  <label className="text-sm font-medium">{tNavBank("createInSchema")}</label>
+                  <Select value={createTargetSchema} onValueChange={setCreateTargetSchema}>
+                    <SelectTrigger>
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="">{tNavBank("personalSchema")}</SelectItem>
+                      {writableSharedSchemas.map((s) => (
+                        <SelectItem key={s.schema_name} value={s.schema_name}>
+                          {s.display_name || s.schema_name}
+                          {s.display_name ? ` (${s.schema_name})` : ""}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+              )}
               <Input
                 placeholder={tAddDocument("createBankIdPlaceholder")}
                 value={newBankId}
@@ -785,6 +877,7 @@ function BankSelectorInner() {
                 <p className="text-sm text-destructive whitespace-pre-wrap">{templateError}</p>
               )}
               {createError && <p className="text-sm text-destructive">{createError}</p>}
+              {createConflicts && <BankConflictAlert conflicts={createConflicts} />}
             </div>
             <DialogFooter>
               <Button
@@ -795,6 +888,7 @@ function BankSelectorInner() {
                   setUseTemplate(false);
                   setTemplateJson("");
                   setCreateError(null);
+                  setCreateConflicts(null);
                   setTemplateError(null);
                 }}
               >

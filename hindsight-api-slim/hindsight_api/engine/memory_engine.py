@@ -313,6 +313,39 @@ def _consolidation_retry_backoff_seconds(retry_count: int) -> int:
     )
 
 
+def _bare_bank_id(bank_id: str) -> str:
+    """Strip a leading ``schema/`` prefix from a (possibly qualified) bank id."""
+    return bank_id.split("/", 1)[1] if "/" in bank_id else bank_id
+
+
+def _annotate_bank_shadows(banks: list[dict[str, Any]]) -> None:
+    """Annotate each bank dict with a ``shadowed_by`` advisory list, in place.
+
+    Groups the already-merged bank list (private bare ids + qualified shared ids)
+    by their BARE id. When a bare id appears in two or more entries, each entry
+    is annotated with ``shadowed_by`` = the fully-qualified ids of the OTHER
+    entries sharing that bare id. Entries that occur once get ``shadowed_by=None``.
+
+    A private (bare) entry is represented in ``shadowed_by`` lists by its bare id
+    (it has no schema prefix); shared entries by their ``schema/bank`` id.
+    Pure and side-effecting only on the provided dicts — no I/O.
+    """
+    from collections import defaultdict
+
+    groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for bank in banks:
+        groups[_bare_bank_id(bank["bank_id"])].append(bank)
+
+    for group in groups.values():
+        if len(group) < 2:
+            for bank in group:
+                bank["shadowed_by"] = None
+            continue
+        ids = [bank["bank_id"] for bank in group]
+        for bank in group:
+            bank["shadowed_by"] = [other for other in ids if other != bank["bank_id"]]
+
+
 class UnqualifiedTableError(Exception):
     """Raised when SQL contains unqualified table references."""
 
@@ -1405,7 +1438,9 @@ class MemoryEngine(MemoryEngineInterface):
     # Shared-schema routing helpers
     # ------------------------------------------------------------------
 
-    async def resolve_bank_target(self, bank_id: str, *, write: bool) -> BankTarget:
+    async def resolve_bank_target(
+        self, bank_id: str, *, write: bool, request_context: "RequestContext | None" = None
+    ) -> BankTarget:
         """Parse a possibly-qualified bank id and enforce shared-schema membership.
 
         Bank ids arrive in two forms:
@@ -1418,7 +1453,9 @@ class MemoryEngine(MemoryEngineInterface):
           a. Validating ``schema`` starts with ``shared_`` (SHARED_SCHEMA_PREFIX).
           b. Checking the caller's membership: ``schema`` must be in the readable
              set (for reads) or writable set (for writes). The primary schema is
-             always allowed. Violation → ``OperationValidationError(status_code=403)``.
+             always allowed. Admin callers (per ``is_admin(request_context.tenant_id)``)
+             bypass membership and may read/write any registered shared schema.
+             Violation → ``OperationValidationError(status_code=403)``.
           c. Verifying the shared schema is registered in ``public.shared_schemas``.
              Not registered → ``OperationValidationError(status_code=404)``.
           d. First-write bootstrap: when ``write=True`` and the schema has not yet
@@ -1442,12 +1479,30 @@ class MemoryEngine(MemoryEngineInterface):
           ``get_tenant_config``); for shared-bank ops the caller's ``request_context``
           is used, which is correct (the caller's tenant policy applies).
         """
-        from hindsight_api.extensions import OperationValidationError
+        from hindsight_api.extensions import AmbiguousBankIdError, OperationValidationError
 
         from . import shared_schemas
 
         if "/" not in bank_id:
-            # Bare id — primary schema, no access check needed.
+            # Bare id — Option A runtime resolver. Search every schema the caller
+            # can address for a bank with this id and route accordingly:
+            #   * 0 matches → primary schema (create-on-write / 404-on-read).
+            #   * 1 match   → that schema (None when it is the primary schema).
+            #   * >=2       → ambiguous; caller must qualify the id.
+            matches = await self._find_bank_in_accessible_schemas(bank_id, request_context)
+            if len(matches) >= 2:
+                raise AmbiguousBankIdError(bank_id, matches)
+            if len(matches) == 1:
+                primary = get_current_schema()
+                resolved_schema = matches[0]
+                if resolved_schema == primary:
+                    return BankTarget(schema=None, bank_id=bank_id)
+                # Resolved to a shared schema. Run the same registry check +
+                # first-write bootstrap the qualified branch performs so a bare
+                # id that maps to a shared schema behaves identically on writes.
+                await self._ensure_shared_schema_ready(resolved_schema, write=write)
+                return BankTarget(schema=resolved_schema, bank_id=bank_id)
+            # 0 matches → primary (create-on-write / 404-on-read preserved).
             return BankTarget(schema=None, bank_id=bank_id)
 
         schema, bare_bank_id = bank_id.split("/", 1)
@@ -1462,8 +1517,17 @@ class MemoryEngine(MemoryEngineInterface):
 
         # (b) Membership check.
         primary = get_current_schema()
+        from hindsight_api.extensions.builtin.github_role_validator import is_admin
+
+        caller_is_admin = is_admin(request_context.tenant_id) if request_context is not None else False
+
         if schema == primary:
             # Primary schema addressed via qualified form — always allowed.
+            pass
+        elif caller_is_admin:
+            # Admins manage the whole shared-schema fleet: they may read and write
+            # any registered shared schema regardless of team membership. The
+            # registry existence check (c) below still applies.
             pass
         elif write:
             allowed = _writable_schemas.get() | frozenset([primary])
@@ -1480,7 +1544,27 @@ class MemoryEngine(MemoryEngineInterface):
                     status_code=403,
                 )
 
-        # (c) Registry check — shared schema must be registered.
+        # (c) Registry check + (d) first-write bootstrap.
+        await self._ensure_shared_schema_ready(schema, write=write)
+
+        return BankTarget(schema=schema, bank_id=bare_bank_id)
+
+    async def _ensure_shared_schema_ready(self, schema: str, *, write: bool) -> None:
+        """Registry check + first-write bootstrap for a shared schema.
+
+        Shared by both the qualified-id branch and the bare-id-resolved-to-shared
+        branch of :meth:`resolve_bank_target` so both paths behave identically:
+
+        * The shared schema must be registered in ``public.shared_schemas``;
+          otherwise raise ``OperationValidationError(status_code=404)``.
+        * On ``write=True``, if the schema has not yet been migrated on this
+          worker, run the (idempotent) migration exactly once, tracked via
+          ``self._bootstrapped_shared_schemas``.
+        """
+        from hindsight_api.extensions import OperationValidationError
+
+        from . import shared_schemas
+
         backend = await self._get_backend()
         exists = await shared_schemas.shared_schema_exists(backend, schema)
         if not exists:
@@ -1489,12 +1573,9 @@ class MemoryEngine(MemoryEngineInterface):
                 status_code=404,
             )
 
-        # (d) First-write bootstrap: ensure the physical schema is migrated.
         if write and schema not in self._bootstrapped_shared_schemas:
             await self._ext_ctx.run_migration(schema)
             self._bootstrapped_shared_schemas.add(schema)
-
-        return BankTarget(schema=schema, bank_id=bare_bank_id)
 
     def _schema_override(self, schema: str | None):
         """Async context manager that temporarily overrides ``_current_schema``.
@@ -2962,6 +3043,31 @@ class MemoryEngine(MemoryEngineInterface):
             # - PG: Alembic migrations with schema support
             # - Oracle: idempotent DDL runner (no Alembic)
             logger.info("Running database migrations...")
+
+            # Always migrate the base/"public" schema first, independent of the
+            # tenant list. The base schema owns objects that live in ``public``
+            # regardless of tenancy — the ``alembic_version`` bookkeeping row,
+            # the ``public.shared_schemas`` registry, and the cross-tenant
+            # maintenance routines — and their migrations only run on a base
+            # (``target_schema``-unset) pass (see the ``_is_base_schema_run()``
+            # guard in those migrations). Multi-tenant extensions (OIDC/GitHub)
+            # return an EMPTY ``list_tenants()`` at boot (schemas are discovered
+            # lazily on first auth), so without this the base schema would never
+            # advance to head on deploy and new ``public`` objects (e.g. the
+            # shared-schemas registry) would silently never be created.
+            # PG only: on Oracle there is no separate ``public`` schema and the
+            # per-user backend.run_migrations path already covers the base DDL.
+            if self._database_backend_type == "postgresql":
+                from ..migrations import run_migrations as _run_base_migration
+
+                await asyncio.to_thread(
+                    _run_base_migration,
+                    self.db_url,
+                    schema=None,  # base/public run -> _is_base_schema_run() is True
+                    migration_database_url=config.migration_database_url,
+                )
+                logger.info("Base (public) schema migrations completed")
+
             tenants = await self._tenant_extension.list_tenants()
             if tenants:
                 logger.info(f"Running migrations on {len(tenants)} schema(s)...")
@@ -3469,10 +3575,9 @@ class MemoryEngine(MemoryEngineInterface):
 
         # Route to the correct schema (primary or shared) and enforce write membership.
         # TODO: all other bank_id-taking methods should adopt resolve_bank_target too.
-        _retain_target = await self.resolve_bank_target(bank_id, write=True)
+        _retain_target = await self.resolve_bank_target(bank_id, write=True, request_context=request_context)
         bank_id = _retain_target.bank_id
         async with self._schema_override(_retain_target.schema):
-
             # Validate operation if validator is configured
             contents_copy = [dict(c) for c in contents]  # Convert TypedDict to regular dict for extension
             if self._operation_validator:
@@ -4237,7 +4342,7 @@ class MemoryEngine(MemoryEngineInterface):
 
         # Route to the correct schema (primary or shared) and enforce read membership.
         # TODO: all other bank_id-taking methods should adopt resolve_bank_target too.
-        _recall_target = await self.resolve_bank_target(bank_id, write=False)
+        _recall_target = await self.resolve_bank_target(bank_id, write=False, request_context=request_context)
         bank_id = _recall_target.bank_id
         async with self._schema_override(_recall_target.schema):
 
@@ -8751,7 +8856,7 @@ class MemoryEngine(MemoryEngineInterface):
         await self._authenticate_tenant(request_context)
         # Route to the correct schema (primary or shared) and enforce read membership.
         # TODO: all other bank_id-taking methods should adopt resolve_bank_target too.
-        _profile_target = await self.resolve_bank_target(bank_id, write=False)
+        _profile_target = await self.resolve_bank_target(bank_id, write=False, request_context=request_context)
         bank_id = _profile_target.bank_id
         async with self._schema_override(_profile_target.schema):
             if self._operation_validator:
@@ -8839,6 +8944,119 @@ class MemoryEngine(MemoryEngineInterface):
         if result.created:
             await self._apply_default_bank_template(bank_id, request_context)
         return result.created
+
+    async def _accessible_schemas(self, request_context: "RequestContext | None") -> set[str]:
+        """Return every schema the caller can address a bank in.
+
+        This is the caller's primary (private) schema plus all shared schemas
+        they may access. For admins that is the full registry; for everyone else
+        it is their team-derived membership set (readable). Used to enforce that
+        a bare bank_id is unambiguous across all of them.
+        """
+        from . import shared_schemas as _shared_schemas
+
+        primary = get_current_schema()
+        schemas: set[str] = {primary}
+        schemas |= set(_readable_schemas.get())
+        schemas |= set(_writable_schemas.get())
+
+        from hindsight_api.extensions.builtin.github_role_validator import is_admin
+
+        if request_context is not None and is_admin(request_context.tenant_id):
+            backend = await self._get_backend()
+            for record in await _shared_schemas.list_shared_schemas(backend):
+                schemas.add(record.schema_name)
+        return schemas
+
+    async def _find_bank_in_accessible_schemas(
+        self,
+        bank_id: str,
+        request_context: "RequestContext | None",
+    ) -> list[str]:
+        """Return every accessible schema that currently holds ``bank_id``.
+
+        Probes each schema the caller can address (private + readable/writable
+        shared + full registry for admins) for a bank with the bare ``bank_id``.
+        Probes run concurrently. The result is ordered deterministically:
+        the primary (current) schema first when present, then the remaining
+        schemas sorted alphabetically. This ordering is relied on by callers
+        (routing decisions, ambiguity conflict lists, and UX).
+        """
+        import asyncio
+
+        schemas = await self._accessible_schemas(request_context)
+        primary = get_current_schema()
+        backend = await self._get_backend()
+
+        # Deterministic probe order: primary first, then the rest sorted.
+        ordered = ([primary] if primary in schemas else []) + sorted(schemas - {primary})
+
+        results = await asyncio.gather(
+            *(bank_utils.bank_id_exists_in_schema(backend, bank_id, schema) for schema in ordered)
+        )
+        return [schema for schema, exists in zip(ordered, results, strict=True) if exists]
+
+    async def _shadow_schemas_for(
+        self,
+        bank_id: str,
+        exclude_schema: str | None,
+        request_context: "RequestContext | None",
+    ) -> list[str]:
+        """Return accessible schemas (other than ``exclude_schema``) holding ``bank_id``.
+
+        Advisory-only: used to surface "this id also exists elsewhere" hints on
+        responses without ever blocking an operation. ``exclude_schema=None``
+        excludes the caller's primary (current) schema — i.e. the schema a bare
+        id resolves to by default. Ordering matches
+        :meth:`_find_bank_in_accessible_schemas` (primary first, then sorted).
+        """
+        excluded = exclude_schema if exclude_schema is not None else get_current_schema()
+        matches = await self._find_bank_in_accessible_schemas(bank_id, request_context)
+        return [s for s in matches if s != excluded]
+
+    async def get_bank_shadows(
+        self,
+        bank_id: str,
+        *,
+        request_context: "RequestContext",
+    ) -> list[str]:
+        """Return fully-qualified ids of banks that shadow ``bank_id`` elsewhere.
+
+        Authenticates, resolves the (possibly qualified) target, then computes
+        the advisory shadow set: other accessible schemas that also hold this
+        bank's bare id. Returns an empty list when there are no shadows. Thin
+        wrapper so HTTP handlers can annotate responses without re-implementing
+        the resolution logic.
+        """
+        await self._authenticate_tenant(request_context)
+        target = await self.resolve_bank_target(bank_id, write=False, request_context=request_context)
+        shadow = await self._shadow_schemas_for(target.bank_id, target.schema, request_context)
+        return [f"{s}/{target.bank_id}" for s in shadow]
+
+    async def get_bank_resolution_advisory(
+        self,
+        bank_id: str,
+        *,
+        write: bool,
+        request_context: "RequestContext",
+    ) -> tuple[str | None, list[str]]:
+        """Return ``(resolved_to, shadowed_by)`` advisory info for a bank id.
+
+        Best-effort, read-only, and non-blocking. Used by write paths (retain) to
+        surface where a bare id was routed:
+
+        * ``resolved_to`` — the fully-qualified id (``"schema/bank"``) when a bare
+          id resolved to a NON-primary (shared) schema; ``None`` otherwise (bare
+          id resolved to primary, or a qualified id was supplied).
+        * ``shadowed_by`` — fully-qualified ids of other accessible schemas that
+          also hold this bare id (may be empty).
+        """
+        await self._authenticate_tenant(request_context)
+        target = await self.resolve_bank_target(bank_id, write=write, request_context=request_context)
+        resolved_to = f"{target.schema}/{target.bank_id}" if target.schema is not None else None
+        shadow = await self._shadow_schemas_for(target.bank_id, target.schema, request_context)
+        shadowed_by = [f"{s}/{target.bank_id}" for s in shadow]
+        return resolved_to, shadowed_by
 
     async def _apply_default_bank_template(
         self,
@@ -9103,6 +9321,9 @@ class MemoryEngine(MemoryEngineInterface):
             )
             bank["disposition"], bank["mission"] = resolved.disposition, resolved.mission
 
+        # Advisory: annotate banks whose bare id is shadowed in another schema.
+        _annotate_bank_shadows(banks)
+
         return banks
 
     # ==================== Reflect Methods ====================
@@ -9189,7 +9410,7 @@ class MemoryEngine(MemoryEngineInterface):
         # Route to the correct schema (primary or shared) and enforce read membership.
         # reflect is read-only (it synthesizes from stored memories, persists nothing).
         # TODO: all other bank_id-taking methods should adopt resolve_bank_target too.
-        _reflect_target = await self.resolve_bank_target(bank_id, write=False)
+        _reflect_target = await self.resolve_bank_target(bank_id, write=False, request_context=request_context)
         bank_id = _reflect_target.bank_id
         async with self._schema_override(_reflect_target.schema):
 
@@ -13145,30 +13366,51 @@ class MemoryEngine(MemoryEngineInterface):
         backend = await self._get_backend()
 
         private_schema = get_current_schema()
+        can_create = is_admin(request_context.tenant_id)
 
-        # Ask the tenant extension which shared schemas this caller may access.
+        # Ask the tenant extension which shared schemas this caller may access
+        # (membership derived from GitHub teams / OIDC groups). ``writable`` per
+        # the read-many/write-many model is True for members.
         ext_schemas = await self._tenant_extension.list_shared_schemas(request_context)
+        member_writable: dict[str, bool] = {s.schema: s.writable for s in ext_schemas}
 
-        shared_out: list[dict] = []
-        for ext_schema in ext_schemas:
-            record = await _shared_schemas.get_shared_schema(backend, ext_schema.schema)
-            if record is None:
-                # Not registered — skip (membership without registration is a
-                # misconfiguration; don't surface it to the caller).
-                logger.debug(
-                    "list_visible_shared_schemas: skipping unregistered schema %s", ext_schema.schema
-                )
-                continue
-            shared_out.append(
+        # Admins manage the whole fleet, so they must see EVERY registered shared
+        # schema — including ones their own team is not mapped to — otherwise a
+        # schema they just created for another team would be invisible to them.
+        # Admins get read+write on all of them (they can already create/drop).
+        # Non-admins only ever see schemas they are a member of.
+        if can_create:
+            registered = await _shared_schemas.list_shared_schemas(backend)
+            shared_out: list[dict] = [
                 {
                     "schema_name": record.schema_name,
                     "display_name": record.display_name,
                     "created_at": record.created_at,
-                    "writable": ext_schema.writable,
+                    # Admins may write everywhere; still reflect membership for
+                    # clarity but never downgrade an admin below writable.
+                    "writable": True,
                 }
-            )
-
-        can_create = is_admin(request_context.tenant_id)
+                for record in registered
+            ]
+        else:
+            shared_out = []
+            for ext_schema in ext_schemas:
+                record = await _shared_schemas.get_shared_schema(backend, ext_schema.schema)
+                if record is None:
+                    # Not registered — skip (membership without registration is a
+                    # misconfiguration; don't surface it to the caller).
+                    logger.debug(
+                        "list_visible_shared_schemas: skipping unregistered schema %s", ext_schema.schema
+                    )
+                    continue
+                shared_out.append(
+                    {
+                        "schema_name": record.schema_name,
+                        "display_name": record.display_name,
+                        "created_at": record.created_at,
+                        "writable": member_writable.get(record.schema_name, ext_schema.writable),
+                    }
+                )
 
         return {
             "private_schema": private_schema,

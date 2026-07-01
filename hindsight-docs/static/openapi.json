@@ -730,6 +730,16 @@
               }
             }
           },
+          "409": {
+            "description": "Bare bank id is ambiguous across accessible schemas (AMBIGUOUS_BANK_ID).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AmbiguousBankIdResponse"
+                }
+              }
+            }
+          },
           "422": {
             "description": "Validation Error",
             "content": {
@@ -795,6 +805,16 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ReflectResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Bare bank id is ambiguous across accessible schemas (AMBIGUOUS_BANK_ID).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AmbiguousBankIdResponse"
                 }
               }
             }
@@ -3483,6 +3503,16 @@
               }
             }
           },
+          "409": {
+            "description": "Bare bank id is ambiguous across accessible schemas (AMBIGUOUS_BANK_ID).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AmbiguousBankIdResponse"
+                }
+              }
+            }
+          },
           "422": {
             "description": "Validation Error",
             "content": {
@@ -3686,6 +3716,16 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/BankProfileResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Bare bank id is ambiguous across accessible schemas (AMBIGUOUS_BANK_ID).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AmbiguousBankIdResponse"
                 }
               }
             }
@@ -5076,6 +5116,16 @@
               }
             }
           },
+          "409": {
+            "description": "Bare bank id is ambiguous across accessible schemas (AMBIGUOUS_BANK_ID).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AmbiguousBankIdResponse"
+                }
+              }
+            }
+          },
           "422": {
             "description": "Validation Error",
             "content": {
@@ -6077,6 +6127,49 @@
           "update_disposition": true
         }
       },
+      "AmbiguousBankIdResponse": {
+        "properties": {
+          "error": {
+            "type": "string",
+            "title": "Error"
+          },
+          "detail": {
+            "type": "string",
+            "title": "Detail"
+          },
+          "conflicts": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Conflicts",
+            "description": "Fully-qualified ids the bare id resolves to"
+          },
+          "code": {
+            "type": "string",
+            "title": "Code",
+            "description": "Machine-readable error code",
+            "default": "AMBIGUOUS_BANK_ID"
+          }
+        },
+        "type": "object",
+        "required": [
+          "error",
+          "detail",
+          "conflicts"
+        ],
+        "title": "AmbiguousBankIdResponse",
+        "description": "409 response body when a bare bank id resolves to multiple accessible schemas.\n\nReturned when the same bare id exists in two or more schemas the caller can\naccess. The caller must refer to the bank by one of the fully-qualified ids\nlisted in ``conflicts`` instead.",
+        "example": {
+          "code": "AMBIGUOUS_BANK_ID",
+          "conflicts": [
+            "user_alice/docs",
+            "shared_dev/docs"
+          ],
+          "detail": "This id exists in multiple schemas you can access. Refer to the bank by its fully-qualified id.",
+          "error": "Bank id 'docs' is ambiguous"
+        }
+      },
       "AsyncOperationSubmitResponse": {
         "properties": {
           "operation_id": {
@@ -6476,6 +6569,21 @@
               }
             ],
             "title": "Last Document At"
+          },
+          "shadowed_by": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Shadowed By",
+            "description": "Advisory: fully-qualified ids of other banks (in schemas you can access) that share this bank's bare id. Present only when at least one shadow exists."
           }
         },
         "type": "object",
@@ -6596,6 +6704,21 @@
             ],
             "title": "Background",
             "description": "Deprecated: use mission instead"
+          },
+          "shadowed_by": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Shadowed By",
+            "description": "Advisory: fully-qualified ids of banks in other schemas you can access that share this bank's bare id. Present only when at least one shadow exists. Never blocks the operation; refer to a bank by its fully-qualified id to be unambiguous."
           }
         },
         "type": "object",
@@ -12364,6 +12487,33 @@
               }
             ],
             "description": "Token usage metrics for LLM calls during fact extraction (only present for synchronous operations)"
+          },
+          "resolved_to": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Resolved To",
+            "description": "Advisory: the fully-qualified id a bare bank_id resolved to when it mapped to a non-primary (shared) schema, e.g. 'shared_dev/docs'. Omitted when the bare id resolved to your primary schema or a qualified id was supplied."
+          },
+          "shadowed_by": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Shadowed By",
+            "description": "Advisory: fully-qualified ids of banks in other schemas you can access that share this bank's bare id. Present only when at least one shadow exists. Never blocks retain."
           }
         },
         "type": "object",

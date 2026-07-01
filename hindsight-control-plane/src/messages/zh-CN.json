@@ -54,7 +54,10 @@
       "switchTitle": "切换记忆库",
       "returnTo": "返回 {bank}",
       "copyName": "复制名称",
-      "copied": "已复制到剪贴板"
+      "copied": "已复制到剪贴板",
+      "createInSchema": "Create in",
+      "personalSchema": "Personal (your private banks)",
+      "shadowedTooltip": "This id also exists in {schemas}. Refer to this bank by its fully-qualified id to avoid ambiguity."
     },
     "viewOnGitHub": "在 GitHub 查看"
   },
@@ -166,6 +169,14 @@
     "deleteWillDeleteDetails": "这将删除 {memories, plural, other {# 条记忆}}、{documents, plural, other {# 个文档}} 和 {links, plural, other {# 个链接}}。",
     "deleteWillDeleteObservations": "这将删除 {count, plural, other {# 个观察}}。",
     "memoryDefense": "记忆防护"
+  },
+  "bankPage": {
+    "shadowBanner": "This bank's id also exists in {schemas}. This view refers to {qualified}. Use fully-qualified ids to avoid ambiguity."
+  },
+  "bankConflict": {
+    "title": "Ambiguous bank id",
+    "body": "This id exists in multiple schemas you can access. Refer to the bank by one of its fully-qualified ids:",
+    "copy": "Copy id"
   },
   "bankProfile": {
     "noBankSelected": "未选择记忆库",
@@ -1558,7 +1569,8 @@
     "observationScopesEmpty": "在上方添加标签以预览观察范围",
     "metadataHelpText": "每行一个 <code>key: value</code>",
     "entitiesHelpText": "逗号分隔的提示，与自动提取的实体合并",
-    "textNotStoredWarning": "此服务器不会存储文档原始文本，仅保留提取的记忆。"
+    "textNotStoredWarning": "此服务器不会存储文档原始文本，仅保留提取的记忆。",
+    "createShadowWarning": "Heads up: a bank named '{bank}' also exists in {schemas}. To use either unambiguously, refer to them by their fully-qualified ids."
   },
   "dashboard": {
     "welcome": "欢迎使用 Hindsight",

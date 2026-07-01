@@ -25,6 +25,38 @@ export type AddBackgroundRequest = {
 };
 
 /**
+ * AmbiguousBankIdResponse
+ *
+ * 409 response body when a bare bank id resolves to multiple accessible schemas.
+ *
+ * Returned when the same bare id exists in two or more schemas the caller can
+ * access. The caller must refer to the bank by one of the fully-qualified ids
+ * listed in ``conflicts`` instead.
+ */
+export type AmbiguousBankIdResponse = {
+  /**
+   * Error
+   */
+  error: string;
+  /**
+   * Detail
+   */
+  detail: string;
+  /**
+   * Conflicts
+   *
+   * Fully-qualified ids the bare id resolves to
+   */
+  conflicts: Array<string>;
+  /**
+   * Code
+   *
+   * Machine-readable error code
+   */
+  code?: string;
+};
+
+/**
  * AsyncOperationSubmitResponse
  *
  * Response model for submitting an async operation.
@@ -274,6 +306,12 @@ export type BankListItem = {
    * Last Document At
    */
   last_document_at?: string | null;
+  /**
+   * Shadowed By
+   *
+   * Advisory: fully-qualified ids of other banks (in schemas you can access) that share this bank's bare id. Present only when at least one shadow exists.
+   */
+  shadowed_by?: Array<string> | null;
 };
 
 /**
@@ -337,6 +375,12 @@ export type BankProfileResponse = {
    * Deprecated: use mission instead
    */
   background?: string | null;
+  /**
+   * Shadowed By
+   *
+   * Advisory: fully-qualified ids of banks in other schemas you can access that share this bank's bare id. Present only when at least one shadow exists. Never blocks the operation; refer to a bank by its fully-qualified id to be unambiguous.
+   */
+  shadowed_by?: Array<string> | null;
 };
 
 /**
@@ -3579,6 +3623,18 @@ export type RetainResponse = {
    * Token usage metrics for LLM calls during fact extraction (only present for synchronous operations)
    */
   usage?: TokenUsage | null;
+  /**
+   * Resolved To
+   *
+   * Advisory: the fully-qualified id a bare bank_id resolved to when it mapped to a non-primary (shared) schema, e.g. 'shared_dev/docs'. Omitted when the bare id resolved to your primary schema or a qualified id was supplied.
+   */
+  resolved_to?: string | null;
+  /**
+   * Shadowed By
+   *
+   * Advisory: fully-qualified ids of banks in other schemas you can access that share this bank's bare id. Present only when at least one shadow exists. Never blocks retain.
+   */
+  shadowed_by?: Array<string> | null;
 };
 
 /**
@@ -4594,6 +4650,10 @@ export type RecallMemoriesData = {
 
 export type RecallMemoriesErrors = {
   /**
+   * Bare bank id is ambiguous across accessible schemas (AMBIGUOUS_BANK_ID).
+   */
+  409: AmbiguousBankIdResponse;
+  /**
    * Validation Error
    */
   422: HttpValidationError;
@@ -4629,6 +4689,10 @@ export type ReflectData = {
 };
 
 export type ReflectErrors = {
+  /**
+   * Bare bank id is ambiguous across accessible schemas (AMBIGUOUS_BANK_ID).
+   */
+  409: AmbiguousBankIdResponse;
   /**
    * Validation Error
    */
@@ -6131,6 +6195,10 @@ export type GetBankProfileData = {
 
 export type GetBankProfileErrors = {
   /**
+   * Bare bank id is ambiguous across accessible schemas (AMBIGUOUS_BANK_ID).
+   */
+  409: AmbiguousBankIdResponse;
+  /**
    * Validation Error
    */
   422: HttpValidationError;
@@ -6313,6 +6381,10 @@ export type CreateOrUpdateBankData = {
 };
 
 export type CreateOrUpdateBankErrors = {
+  /**
+   * Bare bank id is ambiguous across accessible schemas (AMBIGUOUS_BANK_ID).
+   */
+  409: AmbiguousBankIdResponse;
   /**
    * Validation Error
    */
@@ -7090,6 +7162,10 @@ export type RetainMemoriesData = {
 };
 
 export type RetainMemoriesErrors = {
+  /**
+   * Bare bank id is ambiguous across accessible schemas (AMBIGUOUS_BANK_ID).
+   */
+  409: AmbiguousBankIdResponse;
   /**
    * Validation Error
    */

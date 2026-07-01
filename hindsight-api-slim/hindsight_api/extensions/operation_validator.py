@@ -25,6 +25,32 @@ class OperationValidationError(Exception):
         super().__init__(f"Operation validation failed: {reason}")
 
 
+class AmbiguousBankIdError(Exception):
+    """Raised when a bare bank id resolves to more than one accessible schema.
+
+    A bare (unqualified) bank id targets whichever schema currently holds it.
+    When the same id exists in two or more schemas the caller can reach
+    (their private schema and/or one or more shared schemas), the bare form is
+    ambiguous and the caller must instead refer to the bank by its
+    fully-qualified id (``"schema/bank"``).
+
+    Attributes:
+        bank_id: The bare bank id that was ambiguous.
+        schemas: The schemas (in deterministic order — primary first, then the
+            rest sorted alphabetically) in which the id exists.
+    """
+
+    def __init__(self, bank_id: str, schemas: list[str]):
+        self.bank_id = bank_id
+        self.schemas = schemas
+        super().__init__(f"Bank id '{bank_id}' is ambiguous across schemas you can access")
+
+    @property
+    def conflicts(self) -> list[str]:
+        """Fully-qualified ids for each schema the bare id resolves to."""
+        return [f"{s}/{self.bank_id}" for s in self.schemas]
+
+
 @dataclass
 class ValidationResult:
     """Result of an operation validation.

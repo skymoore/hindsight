@@ -38,6 +38,8 @@ from hindsight_api.extensions.memory_defense import (
     parse_policy,
 )
 from hindsight_api.extensions.operation_validator import (
+    # Bank id resolution
+    AmbiguousBankIdError,
     # Bank Management operations
     BankListContext,
     BankListResult,
@@ -90,6 +92,7 @@ __all__ = [
     # MCP Extension
     "MCPExtension",
     # Operation Validator - Core
+    "AmbiguousBankIdError",
     "DeferOperation",
     "OperationValidationError",
     "OperationValidatorExtension",

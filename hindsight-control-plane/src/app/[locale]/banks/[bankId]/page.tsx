@@ -56,6 +56,8 @@ import {
 } from "lucide-react";
 import { LlmHealthDialog } from "@/components/llm-health-dialog";
 import { ExtractDialog } from "@/components/extract-dialog";
+import { Alert, AlertDescription } from "@/components/ui/alert";
+import { AlertTriangle } from "lucide-react";
 
 type NavItem = "recall" | "reflect" | "data" | "documents" | "entities" | "profile";
 type DataSubTab = "world" | "experience" | "observations" | "mental-models";
@@ -73,8 +75,15 @@ export default function BankPage() {
   const searchParams = useSearchParams();
   const t = useTranslations("bank");
   const tCommon = useTranslations("common");
+  const tBankPage = useTranslations("bankPage");
   const { features } = useFeatures();
-  const { currentBank: bankId, setCurrentBank, loadBanks } = useBank();
+  const { currentBank: bankId, setCurrentBank, loadBanks, bankInfos } = useBank();
+
+  // Advisory shadow banner: the current bank's bare id also exists in other
+  // accessible schemas. `shadowed_by` is non-empty only when a shadow exists.
+  const currentBankInfo = bankInfos.find((b) => b.bank_id === bankId);
+  const shadowedBy = currentBankInfo?.shadowed_by;
+  const isShadowed = !!shadowedBy && shadowedBy.length > 0;
 
   const view = (searchParams.get("view") || "profile") as NavItem;
   const subTab = (searchParams.get("subTab") || "world") as DataSubTab;
@@ -195,6 +204,18 @@ export default function BankPage() {
 
         <main className="flex-1 overflow-y-auto">
           <div className="p-6">
+            {/* Advisory: this bank's bare id is shadowed by other schemas. */}
+            {isShadowed && bankId && (
+              <Alert className="mb-6 border-amber-500/50 text-amber-700 dark:text-amber-400 [&>svg]:text-amber-500">
+                <AlertTriangle className="h-4 w-4" />
+                <AlertDescription>
+                  {tBankPage("shadowBanner", {
+                    schemas: shadowedBy!.join(", "),
+                    qualified: bankId,
+                  })}
+                </AlertDescription>
+              </Alert>
+            )}
             {/* Bank Configuration Tab */}
             {view === "profile" && (
               <div>

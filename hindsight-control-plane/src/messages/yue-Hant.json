@@ -54,7 +54,10 @@
       "switchTitle": "切換記憶庫",
       "returnTo": "返回 {bank}",
       "copyName": "複製名稱",
-      "copied": "已複製到剪貼簿"
+      "copied": "已複製到剪貼簿",
+      "createInSchema": "Create in",
+      "personalSchema": "Personal (your private banks)",
+      "shadowedTooltip": "This id also exists in {schemas}. Refer to this bank by its fully-qualified id to avoid ambiguity."
     },
     "viewOnGitHub": "在 GitHub 檢視"
   },
@@ -166,6 +169,14 @@
     "deleteWillDeleteDetails": "將刪除 {memories, plural, other {# 條記憶}}、{documents, plural, other {# 個文件}} 和 {links, plural, other {# 個連結}}。",
     "deleteWillDeleteObservations": "將刪除 {count, plural, other {# 個觀察}}。",
     "memoryDefense": "記憶防護"
+  },
+  "bankPage": {
+    "shadowBanner": "This bank's id also exists in {schemas}. This view refers to {qualified}. Use fully-qualified ids to avoid ambiguity."
+  },
+  "bankConflict": {
+    "title": "Ambiguous bank id",
+    "body": "This id exists in multiple schemas you can access. Refer to the bank by one of its fully-qualified ids:",
+    "copy": "Copy id"
   },
   "bankProfile": {
     "noBankSelected": "未選擇記憶庫",
@@ -1558,7 +1569,8 @@
     "observationScopesEmpty": "在上方新增標籤以預覽觀察範圍",
     "metadataHelpText": "每行一個 <code>key: value</code>",
     "entitiesHelpText": "以逗號分隔的提示，會與自動擷取的實體合併",
-    "textNotStoredWarning": "呢個伺服器唔會儲存文件原始文字，淨係保留擷取到嘅記憶。"
+    "textNotStoredWarning": "呢個伺服器唔會儲存文件原始文字，淨係保留擷取到嘅記憶。",
+    "createShadowWarning": "Heads up: a bank named '{bank}' also exists in {schemas}. To use either unambiguously, refer to them by their fully-qualified ids."
   },
   "dashboard": {
     "welcome": "歡迎使用 Hindsight",
