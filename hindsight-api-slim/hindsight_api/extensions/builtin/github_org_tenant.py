@@ -58,7 +58,12 @@ from hindsight_api.extensions.builtin.github_org_shared import (
     parse_role_from_org_tenant_id,
     validate_authz_profile,
 )
-from hindsight_api.extensions.builtin.github_tenant import GitHubTenantExtension
+from hindsight_api.extensions.builtin.github_tenant import (
+    _MEMBER_ALLOWED_FIELDS,
+    ROLE_ADMIN,
+    ROLE_MEMBER,
+    GitHubTenantExtension,
+)
 from hindsight_api.extensions.builtin.oidc_tenant import Identity
 from hindsight_api.extensions.tenant import AuthenticationError, Tenant
 from hindsight_api.models import RequestContext
@@ -214,3 +219,31 @@ class GitHubOrgTenantExtension(GitHubTenantExtension):
         if self._org_id is None:
             return []
         return [Tenant(schema=f"{self.schema_prefix}_{self._org_id}")]
+
+    # ------------------------------------------------------------------
+    # Capability gating: bank-config write permissions per role
+    # ------------------------------------------------------------------
+
+    async def get_allowed_config_fields(self, context: RequestContext, bank_id: str) -> set[str] | None:
+        """Restrict which bank-config fields a role may modify.
+
+        Overrides :meth:`GitHubTenantExtension.get_allowed_config_fields`, which
+        parses the role with the base ``parse_role_from_tenant_id``. That parser
+        splits on the first ``:`` and returns everything after it, so for this
+        extension's login-aware tenant_id ``gh_<id>:<role>:<login>`` it would
+        yield ``"<role>:<login>"`` and never match a bare role — silently
+        denying *all* config writes (including for admins), which breaks bank
+        config updates and template import (``apply_bank_template_manifest`` ->
+        ``ConfigResolver.override``). We re-derive the role with the login-aware
+        :func:`parse_role_from_org_tenant_id`.
+
+        - admin  -> None (all configurable fields)
+        - member -> a curated subset (inherited from github_tenant)
+        - viewer / unknown -> empty set (read-only, fail closed)
+        """
+        role = parse_role_from_org_tenant_id(context.tenant_id)
+        if role == ROLE_ADMIN:
+            return None
+        if role == ROLE_MEMBER:
+            return set(_MEMBER_ALLOWED_FIELDS)
+        return set()

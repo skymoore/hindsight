@@ -122,6 +122,52 @@ class TestTenantIdCodec:
         assert parse_role_from_org_tenant_id("gh_1024") is None
 
 
+class TestTenantAllowedConfigFields:
+    """get_allowed_config_fields must derive the role with the login-aware parser.
+
+    Regression for the template-import / bank-config failure: the inherited
+    github_tenant implementation parses the role with the base
+    parse_role_from_tenant_id, which folds the login into the role for a
+    gh_<id>:<role>:<login> tenant_id and denies *all* config writes (even for
+    admins).
+    """
+
+    @staticmethod
+    def _tenant():
+        # The method reads only context.tenant_id, so bypass __init__ (which
+        # requires GitHub org config / network wiring).
+        from hindsight_api.extensions.builtin.github_org_tenant import GitHubOrgTenantExtension
+
+        return GitHubOrgTenantExtension.__new__(GitHubOrgTenantExtension)
+
+    @pytest.mark.asyncio
+    async def test_admin_with_login_allows_all(self):
+        t = self._tenant()
+        # gh_<id>:admin:<login> must resolve to admin -> None (allow all).
+        assert await t.get_allowed_config_fields(_ctx("1024", "admin", "skymoore"), "portal-dev") is None
+
+    @pytest.mark.asyncio
+    async def test_admin_legacy_two_segment_allows_all(self):
+        t = self._tenant()
+        assert await t.get_allowed_config_fields(_ctx("1024", "admin"), "portal-dev") is None
+
+    @pytest.mark.asyncio
+    async def test_member_with_login_allows_subset(self):
+        from hindsight_api.extensions.builtin.github_tenant import _MEMBER_ALLOWED_FIELDS
+
+        t = self._tenant()
+        allowed = await t.get_allowed_config_fields(_ctx("55", "member", "octocat"), "b")
+        assert allowed == set(_MEMBER_ALLOWED_FIELDS)
+
+    @pytest.mark.asyncio
+    async def test_viewer_and_unknown_deny_all(self):
+        t = self._tenant()
+        assert await t.get_allowed_config_fields(_ctx("7", "viewer", "v"), "b") == set()
+        # Unparseable role -> fail closed (empty set), never None.
+        bad = RequestContext(api_key="x", tenant_id="garbage")
+        assert await t.get_allowed_config_fields(bad, "b") == set()
+
+
 class TestSharedHelpers:
     def test_parse_user_id_variants(self):
         assert parse_user_id_from_tenant_id("gh_1024:admin") == "1024"
