@@ -54,7 +54,9 @@
       "switchTitle": "Switch memory bank",
       "returnTo": "Return to {bank}",
       "copyName": "Copy name",
-      "copied": "Copied to clipboard"
+      "copied": "Copied to clipboard",
+      "private": "Private",
+      "shared": "Shared"
     },
     "viewOnGitHub": "View on GitHub"
   },
@@ -165,7 +167,12 @@
     "llmRequestsNotEnabled": "LLM Requests Not Enabled",
     "llmRequestsDisabledMessage": "LLM request tracing is disabled on this server. Set <envVar></envVar> to enable.",
     "deleteWillDeleteDetails": "This will delete {memories, plural, one {# memory} other {# memories}}, {documents, plural, one {# document} other {# documents}}, and {links, plural, one {# link} other {# links}}.",
-    "deleteWillDeleteObservations": "This will delete {count, plural, one {# observation} other {# observations}}."
+    "deleteWillDeleteObservations": "This will delete {count, plural, one {# observation} other {# observations}}.",
+    "shareWithTeam": "Share with team",
+    "makePrivate": "Make private",
+    "shareSuccess": "Bank shared with team",
+    "makePrivateSuccess": "Bank made private",
+    "visibilityError": "Failed to update visibility"
   },
   "bankProfile": {
     "noBankSelected": "No Bank Selected",
@@ -1604,7 +1611,10 @@
         "update": "Failed to update bank",
         "delete": "Failed to delete bank",
         "exportTemplate": "Failed to export bank template",
-        "importTemplate": "Failed to import bank template"
+        "importTemplate": "Failed to import bank template",
+        "visibilityFetch": "Failed to fetch bank visibility",
+        "visibilityUpdate": "Failed to update bank visibility",
+        "visibilityList": "Failed to fetch banks visibility"
       },
       "bankConfig": {
         "fetch": "Failed to fetch bank config",

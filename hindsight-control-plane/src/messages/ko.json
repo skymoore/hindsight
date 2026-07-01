@@ -54,7 +54,9 @@
       "switchTitle": "메모리 뱅크 전환",
       "returnTo": "{bank}로 돌아가기",
       "copyName": "이름 복사",
-      "copied": "클립보드에 복사됨"
+      "copied": "클립보드에 복사됨",
+      "private": "비공개",
+      "shared": "공유됨"
     },
     "viewOnGitHub": "GitHub에서 보기"
   },
@@ -165,7 +167,12 @@
     "llmRequestsDisabledMessage": "이 서버에서는 LLM 요청 추적이 비활성화되어 있습니다. 활성화하려면 <envVar></envVar>를 설정하세요.",
     "deleteWillDeleteDetails": "{memories, plural, other {# 메모리}}, {documents, plural, other {# 문서}}, {links, plural, other {# 링크}}가 삭제됩니다.",
     "deleteWillDeleteObservations": "{count, plural, other {# 관찰}}이 삭제됩니다.",
-    "memoryDefense": "메모리 방어"
+    "memoryDefense": "메모리 방어",
+    "shareWithTeam": "팀과 공유",
+    "makePrivate": "비공개로 전환",
+    "shareSuccess": "뱅크를 팀과 공유했습니다",
+    "makePrivateSuccess": "뱅크를 비공개로 설정했습니다",
+    "visibilityError": "공개 설정을 업데이트하지 못했습니다"
   },
   "bankProfile": {
     "noBankSelected": "선택된 뱅크 없음",
@@ -1604,7 +1611,10 @@
         "update": "메모리 뱅크를 업데이트하지 못했습니다",
         "delete": "메모리 뱅크를 삭제하지 못했습니다",
         "exportTemplate": "메모리 뱅크 템플릿을 내보내지 못했습니다",
-        "importTemplate": "메모리 뱅크 템플릿을 가져오지 못했습니다"
+        "importTemplate": "메모리 뱅크 템플릿을 가져오지 못했습니다",
+        "visibilityFetch": "뱅크 공개 설정을 가져오지 못했습니다",
+        "visibilityUpdate": "뱅크 공개 설정을 업데이트하지 못했습니다",
+        "visibilityList": "뱅크 공개 설정을 가져오지 못했습니다"
       },
       "bankConfig": {
         "fetch": "뱅크 구성을 가져오지 못했습니다",

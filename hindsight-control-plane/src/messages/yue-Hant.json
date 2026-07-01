@@ -54,7 +54,9 @@
       "switchTitle": "切換記憶庫",
       "returnTo": "返回 {bank}",
       "copyName": "複製名稱",
-      "copied": "已複製到剪貼簿"
+      "copied": "已複製到剪貼簿",
+      "private": "私人",
+      "shared": "共享"
     },
     "viewOnGitHub": "在 GitHub 檢視"
   },
@@ -165,7 +167,12 @@
     "llmRequestsDisabledMessage": "此伺服器上的 LLM 請求追蹤已停用。請設定 <envVar></envVar> 以啟用。",
     "deleteWillDeleteDetails": "將刪除 {memories, plural, other {# 條記憶}}、{documents, plural, other {# 個文件}} 和 {links, plural, other {# 個連結}}。",
     "deleteWillDeleteObservations": "將刪除 {count, plural, other {# 個觀察}}。",
-    "memoryDefense": "記憶防護"
+    "memoryDefense": "記憶防護",
+    "shareWithTeam": "同團隊分享",
+    "makePrivate": "設為私人",
+    "shareSuccess": "已同團隊分享記憶庫",
+    "makePrivateSuccess": "已將記憶庫設為私人",
+    "visibilityError": "更新可見性失敗"
   },
   "bankProfile": {
     "noBankSelected": "未選擇記憶庫",
@@ -1604,7 +1611,10 @@
         "update": "未能更新記憶庫",
         "delete": "未能刪除記憶庫",
         "exportTemplate": "未能匯出記憶庫範本",
-        "importTemplate": "未能匯入記憶庫範本"
+        "importTemplate": "未能匯入記憶庫範本",
+        "visibilityFetch": "無法取得記憶庫可見性",
+        "visibilityUpdate": "無法更新記憶庫可見性",
+        "visibilityList": "無法取得記憶庫可見性"
       },
       "bankConfig": {
         "fetch": "未能載入記憶庫設定",

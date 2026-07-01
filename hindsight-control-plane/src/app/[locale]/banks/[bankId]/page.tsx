@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useParams, useRouter, useSearchParams } from "next/navigation";
 import { useTranslations } from "next-intl";
 import { toast } from "sonner";
@@ -53,6 +53,8 @@ import {
   RotateCcw,
   Activity,
   FlaskConical,
+  Share2,
+  Lock,
 } from "lucide-react";
 import { LlmHealthDialog } from "@/components/llm-health-dialog";
 import { ExtractDialog } from "@/components/extract-dialog";
@@ -96,6 +98,51 @@ export default function BankPage() {
   const [isRecoveringConsolidation, setIsRecoveringConsolidation] = useState(false);
   const [showResetConfigDialog, setShowResetConfigDialog] = useState(false);
   const [isResettingConfig, setIsResettingConfig] = useState(false);
+
+  // Bank visibility (private/shared) state
+  const [visibility, setVisibility] = useState<"private" | "shared" | null>(null);
+  const [canShare, setCanShare] = useState(false);
+  const [isUpdatingVisibility, setIsUpdatingVisibility] = useState(false);
+
+  useEffect(() => {
+    if (!bankId) {
+      setVisibility(null);
+      setCanShare(false);
+      return;
+    }
+    let cancelled = false;
+    client
+      .getBankVisibility(bankId)
+      .then((result) => {
+        if (cancelled) return;
+        setVisibility(result.visibility);
+        setCanShare(result.can_share);
+      })
+      .catch(() => {
+        // Visibility feature may be disabled on the dataplane — hide the control.
+        if (cancelled) return;
+        setVisibility(null);
+        setCanShare(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [bankId]);
+
+  const handleToggleVisibility = async () => {
+    if (!bankId || !visibility) return;
+    const next = visibility === "private" ? "shared" : "private";
+    setIsUpdatingVisibility(true);
+    try {
+      const result = await client.setBankVisibility(bankId, next);
+      setVisibility(result.visibility);
+      toast.success(next === "shared" ? t("shareSuccess") : t("makePrivateSuccess"));
+    } catch {
+      toast.error(t("visibilityError"));
+    } finally {
+      setIsUpdatingVisibility(false);
+    }
+  };
 
   const handleTabChange = (tab: NavItem) => {
     if (!bankId) return;
@@ -237,6 +284,19 @@ export default function BankPage() {
                         <DropdownMenuItem onClick={() => setShowLlmHealthDialog(true)}>
                           <Activity className="w-4 h-4 mr-2" />
                           {t("health")}
+                        </DropdownMenuItem>
+                      )}
+                      {canShare && visibility && (
+                        <DropdownMenuItem
+                          onClick={handleToggleVisibility}
+                          disabled={isUpdatingVisibility}
+                        >
+                          {visibility === "private" ? (
+                            <Share2 className="w-4 h-4 mr-2" />
+                          ) : (
+                            <Lock className="w-4 h-4 mr-2" />
+                          )}
+                          {visibility === "private" ? t("shareWithTeam") : t("makePrivate")}
                         </DropdownMenuItem>
                       )}
                       <DropdownMenuSeparator />

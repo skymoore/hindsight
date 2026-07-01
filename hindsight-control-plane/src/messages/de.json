@@ -54,7 +54,9 @@
       "switchTitle": "Speicherbank wechseln",
       "returnTo": "Zurück zu {bank}",
       "copyName": "Name kopieren",
-      "copied": "In Zwischenablage kopiert"
+      "copied": "In Zwischenablage kopiert",
+      "private": "Privat",
+      "shared": "Geteilt"
     },
     "viewOnGitHub": "Auf GitHub ansehen"
   },
@@ -165,7 +167,12 @@
     "llmRequestsDisabledMessage": "Das Tracing von LLM-Anfragen ist auf diesem Server deaktiviert. Setzen Sie <envVar></envVar>, um es zu aktivieren.",
     "deleteWillDeleteDetails": "Dadurch werden {memories, plural, one {# Erinnerung} other {# Erinnerungen}}, {documents, plural, one {# Dokument} other {# Dokumente}} und {links, plural, one {# Verknüpfung} other {# Verknüpfungen}} gelöscht.",
     "deleteWillDeleteObservations": "Dadurch werden {count, plural, one {# Beobachtung} other {# Beobachtungen}} gelöscht.",
-    "memoryDefense": "Speicherschutz"
+    "memoryDefense": "Speicherschutz",
+    "shareWithTeam": "Mit dem Team teilen",
+    "makePrivate": "Privat machen",
+    "shareSuccess": "Bank mit dem Team geteilt",
+    "makePrivateSuccess": "Bank auf privat gesetzt",
+    "visibilityError": "Sichtbarkeit konnte nicht aktualisiert werden"
   },
   "bankProfile": {
     "noBankSelected": "Keine Bank ausgewählt",
@@ -1604,7 +1611,10 @@
         "update": "Speicherbank konnte nicht aktualisiert werden",
         "delete": "Speicherbank konnte nicht gelöscht werden",
         "exportTemplate": "Vorlage der Speicherbank konnte nicht exportiert werden",
-        "importTemplate": "Vorlage der Speicherbank konnte nicht importiert werden"
+        "importTemplate": "Vorlage der Speicherbank konnte nicht importiert werden",
+        "visibilityFetch": "Bankensichtbarkeit konnte nicht abgerufen werden",
+        "visibilityUpdate": "Banksichtbarkeit konnte nicht aktualisiert werden",
+        "visibilityList": "Sichtbarkeit der Banken konnte nicht abgerufen werden"
       },
       "bankConfig": {
         "fetch": "Bankkonfiguration konnte nicht abgerufen werden",

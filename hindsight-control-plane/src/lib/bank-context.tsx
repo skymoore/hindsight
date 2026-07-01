@@ -12,6 +12,7 @@ export interface BankInfo {
   updated_at: string | null;
   fact_count: number;
   last_document_at: string | null;
+  visibility?: "private" | "shared";
 }
 
 interface BankContextType {
@@ -45,6 +46,22 @@ export function BankProvider({ children }: { children: React.ReactNode }) {
           fact_count: bank.fact_count ?? 0,
           last_document_at: bank.last_document_at ?? null,
         })) || [];
+
+      // Best-effort merge of per-bank visibility. The visibility feature may be
+      // disabled on the dataplane, in which case we simply leave it undefined.
+      try {
+        const visibilityResponse = await client.listBankVisibility();
+        const visibilityById = new Map(
+          (visibilityResponse.banks ?? []).map((b) => [b.bank_id, b.visibility])
+        );
+        for (const info of infos) {
+          const visibility = visibilityById.get(info.bank_id);
+          if (visibility) info.visibility = visibility;
+        }
+      } catch {
+        // Visibility feature unavailable — leave visibility undefined.
+      }
+
       setBankInfos(infos);
     } catch (error) {
       console.error("Error loading banks:", error);

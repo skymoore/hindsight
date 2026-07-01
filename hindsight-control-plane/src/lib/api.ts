@@ -1598,6 +1598,69 @@ export class ControlPlaneClient {
   }
 
   /**
+   * Get the visibility (private/shared) of a bank for the current user.
+   */
+  async getBankVisibility(bankId: string): Promise<{
+    bank_id: string;
+    owner_user_id: string;
+    is_owner: boolean;
+    visibility: "private" | "shared";
+    can_share: boolean;
+  }> {
+    return this.fetchApi<{
+      bank_id: string;
+      owner_user_id: string;
+      is_owner: boolean;
+      visibility: "private" | "shared";
+      can_share: boolean;
+    }>(bankApi(bankId, "/visibility"));
+  }
+
+  /**
+   * Set the visibility (private/shared) of a bank.
+   */
+  async setBankVisibility(
+    bankId: string,
+    visibility: "private" | "shared"
+  ): Promise<{
+    bank_id: string;
+    owner_user_id: string;
+    visibility: "private" | "shared";
+    can_share: boolean;
+  }> {
+    return this.fetchApi<{
+      bank_id: string;
+      owner_user_id: string;
+      visibility: "private" | "shared";
+      can_share: boolean;
+    }>(bankApi(bankId, "/visibility"), {
+      method: "PUT",
+      body: JSON.stringify({ visibility }),
+    });
+  }
+
+  /**
+   * List visibility for all banks the current user can see.
+   */
+  async listBankVisibility(): Promise<{
+    banks: Array<{
+      bank_id: string;
+      visibility: "private" | "shared";
+      is_owner: boolean;
+      can_share: boolean;
+    }>;
+  }> {
+    return this.fetchApi<{
+      banks: Array<{
+        bank_id: string;
+        visibility: "private" | "shared";
+        is_owner: boolean;
+        can_share: boolean;
+      }>;
+    }>("/api/banks/visibility");
+  }
+
+  /**
    * List webhooks for a bank
    */
   async listWebhooks(bankId: string): Promise<{ items: Webhook[] }> {

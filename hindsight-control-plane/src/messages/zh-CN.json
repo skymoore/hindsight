@@ -54,7 +54,9 @@
       "switchTitle": "切换记忆库",
       "returnTo": "返回 {bank}",
       "copyName": "复制名称",
-      "copied": "已复制到剪贴板"
+      "copied": "已复制到剪贴板",
+      "private": "私有",
+      "shared": "共享"
     },
     "viewOnGitHub": "在 GitHub 查看"
   },
@@ -165,7 +167,12 @@
     "llmRequestsDisabledMessage": "此服务器上的 LLM 请求追踪已禁用。请设置 <envVar></envVar> 以启用。",
     "deleteWillDeleteDetails": "这将删除 {memories, plural, other {# 条记忆}}、{documents, plural, other {# 个文档}} 和 {links, plural, other {# 个链接}}。",
     "deleteWillDeleteObservations": "这将删除 {count, plural, other {# 个观察}}。",
-    "memoryDefense": "记忆防护"
+    "memoryDefense": "记忆防护",
+    "shareWithTeam": "与团队共享",
+    "makePrivate": "设为私有",
+    "shareSuccess": "记忆库已与团队共享",
+    "makePrivateSuccess": "记忆库已设为私有",
+    "visibilityError": "更新可见性失败"
   },
   "bankProfile": {
     "noBankSelected": "未选择记忆库",
@@ -1604,7 +1611,10 @@
         "update": "更新记忆库失败",
         "delete": "删除记忆库失败",
         "exportTemplate": "导出记忆库模板失败",
-        "importTemplate": "导入记忆库模板失败"
+        "importTemplate": "导入记忆库模板失败",
+        "visibilityFetch": "获取记忆库可见性失败",
+        "visibilityUpdate": "更新记忆库可见性失败",
+        "visibilityList": "获取记忆库可见性失败"
       },
       "bankConfig": {
         "fetch": "获取记忆库配置失败",

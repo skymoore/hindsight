@@ -54,7 +54,9 @@
       "switchTitle": "Trocar banco de memória",
       "returnTo": "Voltar para {bank}",
       "copyName": "Copiar nome",
-      "copied": "Copiado para a área de transferência"
+      "copied": "Copiado para a área de transferência",
+      "private": "Privado",
+      "shared": "Compartilhado"
     },
     "viewOnGitHub": "Ver no GitHub"
   },
@@ -165,7 +167,12 @@
     "llmRequestsDisabledMessage": "O rastreamento de requisições LLM está desabilitado neste servidor. Defina <envVar></envVar> para habilitar.",
     "deleteWillDeleteDetails": "Isso excluirá {memories, plural, one {# memória} other {# memórias}}, {documents, plural, one {# documento} other {# documentos}} e {links, plural, one {# link} other {# links}}.",
     "deleteWillDeleteObservations": "Isso excluirá {count, plural, one {# observação} other {# observações}}.",
-    "memoryDefense": "Defesa da memória"
+    "memoryDefense": "Defesa da memória",
+    "shareWithTeam": "Compartilhar com a equipe",
+    "makePrivate": "Tornar privado",
+    "shareSuccess": "Banco compartilhado com a equipe",
+    "makePrivateSuccess": "Banco tornado privado",
+    "visibilityError": "Falha ao atualizar a visibilidade"
   },
   "bankProfile": {
     "noBankSelected": "Nenhum Banco Selecionado",
@@ -1604,7 +1611,10 @@
         "update": "Falha ao atualizar banco de memória",
         "delete": "Falha ao excluir banco de memória",
         "exportTemplate": "Falha ao exportar modelo do banco de memória",
-        "importTemplate": "Falha ao importar modelo do banco de memória"
+        "importTemplate": "Falha ao importar modelo do banco de memória",
+        "visibilityFetch": "Falha ao obter a visibilidade do banco",
+        "visibilityUpdate": "Falha ao atualizar a visibilidade do banco",
+        "visibilityList": "Falha ao obter a visibilidade dos bancos"
       },
       "bankConfig": {
         "fetch": "Falha ao buscar configuração do banco",

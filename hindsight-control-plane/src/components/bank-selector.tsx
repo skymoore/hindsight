@@ -558,6 +558,21 @@ function BankSelectorInner() {
                           <span className="truncate flex-1 font-medium" title={bank.bank_id}>
                             {bank.bank_id}
                           </span>
+                          {bank.visibility && (
+                            <span
+                              className="inline-flex items-center gap-1 shrink-0 text-[11px] text-muted-foreground/70"
+                              title={
+                                bank.visibility === "private"
+                                  ? tNavBank("private")
+                                  : tNavBank("shared")
+                              }
+                            >
+                              <Lock className="h-3 w-3" />
+                              {bank.visibility === "private"
+                                ? tNavBank("private")
+                                : tNavBank("shared")}
+                            </span>
+                          )}
                           <button
                             type="button"
                             aria-label={tNavBank("copyName")}

@@ -54,7 +54,9 @@
       "switchTitle": "Changer de banque de mémoire",
       "returnTo": "Retourner à {bank}",
       "copyName": "Copier le nom",
-      "copied": "Copié dans le presse-papiers"
+      "copied": "Copié dans le presse-papiers",
+      "private": "Privé",
+      "shared": "Partagé"
     },
     "viewOnGitHub": "Voir sur GitHub"
   },
@@ -165,7 +167,12 @@
     "llmRequestsDisabledMessage": "Le traçage des requêtes LLM est désactivé sur ce serveur. Définissez <envVar></envVar> pour l'activer.",
     "deleteWillDeleteDetails": "Cela supprimera {memories, plural, one {# mémoire} other {# mémoires}}, {documents, plural, one {# document} other {# documents}} et {links, plural, one {# lien} other {# liens}}.",
     "deleteWillDeleteObservations": "Cela supprimera {count, plural, one {# observation} other {# observations}}.",
-    "memoryDefense": "Défense de la mémoire"
+    "memoryDefense": "Défense de la mémoire",
+    "shareWithTeam": "Partager avec l'équipe",
+    "makePrivate": "Rendre privé",
+    "shareSuccess": "Banque partagée avec l'équipe",
+    "makePrivateSuccess": "Banque rendue privée",
+    "visibilityError": "Échec de la mise à jour de la visibilité"
   },
   "bankProfile": {
     "noBankSelected": "Aucune banque sélectionnée",
@@ -1604,7 +1611,10 @@
         "update": "Impossible de mettre à jour la banque de mémoire",
         "delete": "Impossible de supprimer la banque de mémoire",
         "exportTemplate": "Impossible d'exporter le modèle de banque de mémoire",
-        "importTemplate": "Impossible d'importer le modèle de banque de mémoire"
+        "importTemplate": "Impossible d'importer le modèle de banque de mémoire",
+        "visibilityFetch": "Échec de la récupération de la visibilité de la banque",
+        "visibilityUpdate": "Échec de la mise à jour de la visibilité de la banque",
+        "visibilityList": "Échec de la récupération de la visibilité des banques"
       },
       "bankConfig": {
         "fetch": "Impossible de récupérer la configuration de la banque",

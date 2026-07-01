@@ -54,7 +54,9 @@
       "switchTitle": "メモリバンクを切り替え",
       "returnTo": "{bank}に戻る",
       "copyName": "名前をコピー",
-      "copied": "クリップボードにコピーしました"
+      "copied": "クリップボードにコピーしました",
+      "private": "プライベート",
+      "shared": "共有"
     },
     "viewOnGitHub": "GitHubで表示"
   },
@@ -165,7 +167,12 @@
     "llmRequestsDisabledMessage": "このサーバーではLLMリクエストのトレースが無効になっています。有効にするには <envVar></envVar> を設定してください。",
     "deleteWillDeleteDetails": "{memories, plural, other {# 件のメモリ}}、{documents, plural, other {# 件のドキュメント}}、および {links, plural, other {# 件のリンク}} が削除されます。",
     "deleteWillDeleteObservations": "{count, plural, other {# 件の観測}} が削除されます。",
-    "memoryDefense": "メモリ防御"
+    "memoryDefense": "メモリ防御",
+    "shareWithTeam": "チームと共有",
+    "makePrivate": "プライベートにする",
+    "shareSuccess": "バンクをチームと共有しました",
+    "makePrivateSuccess": "バンクをプライベートにしました",
+    "visibilityError": "可視性の更新に失敗しました"
   },
   "bankProfile": {
     "noBankSelected": "バンクが選択されていません",
@@ -1604,7 +1611,10 @@
         "update": "メモリバンクの更新に失敗しました",
         "delete": "メモリバンクの削除に失敗しました",
         "exportTemplate": "メモリバンクテンプレートのエクスポートに失敗しました",
-        "importTemplate": "メモリバンクテンプレートのインポートに失敗しました"
+        "importTemplate": "メモリバンクテンプレートのインポートに失敗しました",
+        "visibilityFetch": "バンクの可視性の取得に失敗しました",
+        "visibilityUpdate": "バンクの可視性の更新に失敗しました",
+        "visibilityList": "バンクの可視性の取得に失敗しました"
       },
       "bankConfig": {
         "fetch": "バンク設定の取得に失敗しました",
